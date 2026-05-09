@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "literature-surveyor-talent"
+version = "0.1.0"
+description = "Systematic literature review talent for AutoResearch / OMC"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Steven", email = "stevenkaseiyo@gmail.com" }]
+
+dependencies = [
+    "backoff>=2.2,<3",
+    "requests>=2.32,<3",
+    "pymupdf4llm>=0.0.10",
+    "pypdf>=4.0",
+    "pydantic>=2.9,<3",
+    "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.12",
+    "responses>=0.25",
+]
+
+[tool.setuptools]
+# Each tool subdir + schemas are importable; tests/ is excluded.
+packages = ["schemas"]
+# Explicit empty list keeps setuptools from auto-scanning weird subdirs.
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: tests that hit live APIs (skip in CI)",
+    "asyncio: async tests",
+]
+asyncio_mode = "auto"

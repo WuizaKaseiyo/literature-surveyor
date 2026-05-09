@@ -1,0 +1,22 @@
+# tools/manifest.yaml — declares which custom tools this talent installs
+# When the talent is hired, OMC's onboarding.install_talent_functions() reads this
+# and registers each tool into the company-wide tool_registry, granting access
+# to the new employee.
+
+custom_tools:
+  - arxiv_search
+  - semantic_scholar_search
+  - openalex_search
+  - parallel_multi_search
+  - pdf_extract
+  - corpus_add_paper
+  - corpus_search
+  - corpus_status
+  - corpus_list_papers
+  - corpus_get_paper
+  - extract_claims
+  - verify_citations
+  - self_assess
+
+# Note: corpus_store.py defines 5 separate @tool functions (not just one).
+# OMC's loader inspects each .py for @tool decorators and registers each.

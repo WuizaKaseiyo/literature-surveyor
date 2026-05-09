@@ -1,0 +1,32 @@
+# Vessel DNA for Literature Surveyor Pro
+# Loaded by OMC's vessel_config.load_vessel_config(emp_dir)
+# Falls back to OMC's default_vessel.yaml for any field omitted here.
+
+runner:
+  module: ""              # empty → standard EmployeeAgent (LangChain)
+  class_name: ""
+
+hooks:
+  module: ""
+  pre_task: ""
+  post_task: ""           # could be "verify_citations_post_task" once implemented as hook
+
+context:
+  prompt_sections: []     # talent_persona.md auto-injected by onboarding
+  inject_progress_log: true
+  inject_task_history: true
+
+limits:
+  # Literature surveys need many tool calls (search → extract × N papers → verify)
+  max_retries: 3
+  retry_delays: [10, 30, 60]
+  max_subtask_iterations: 3
+  max_subtask_depth: 1                   # this talent should NOT dispatch children
+  task_timeout_seconds: 1800             # 30 min (default 600 too short for surveys)
+  max_iterations: 60                     # LangGraph recursion_limit (default 25 too small)
+
+capabilities:
+  file_upload: true                      # CEO may upload reference PDFs
+  websocket: true
+  sandbox: false
+  image_generation: false

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/1mancompany/talent-template/main/schemas/manifest.schema.json",
+  "settings_ui": {
+    "sections": [
+      {
+        "title": "API Keys (optional, but recommended)",
+        "fields": [
+          {
+            "name": "S2_API_KEY",
+            "label": "Semantic Scholar API Key",
+            "type": "secret",
+            "required": false,
+            "description": "Get one at https://www.semanticscholar.org/product/api — without it, requests are heavily rate-limited."
+          },
+          {
+            "name": "OPENALEX_MAILTO",
+            "label": "OpenAlex polite-pool email",
+            "type": "text",
+            "required": false,
+            "description": "Your email — joins OpenAlex's polite pool for faster + more stable responses."
+          }
+        ]
+      },
+      {
+        "title": "Behavior",
+        "fields": [
+          {
+            "name": "MAX_CORPUS_SIZE",
+            "label": "Max papers per survey",
+            "type": "number",
+            "default": 30,
+            "description": "Cap how many papers the talent fetches before forced to summarize. Higher = more thorough but slower/more expensive."
+          },
+          {
+            "name": "STRICT_CITATION_VERIFICATION",
+            "label": "Block on hallucinated citations",
+            "type": "toggle",
+            "default": true,
+            "description": "If on, output is rejected when verify_citations finds any unverified citation. If off, unverified cites are flagged but not blocked."
+          }
+        ]
+      }
+    ]
+  }
+}

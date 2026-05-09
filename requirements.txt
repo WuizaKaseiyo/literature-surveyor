@@ -1,0 +1,9 @@
+# Runtime dependencies — installed when this talent is hired into OMC.
+# Pin loosely; OMC may already have stricter pins for langchain-* etc.
+
+backoff>=2.2,<3
+requests>=2.32,<3
+pymupdf4llm>=0.0.10
+pypdf>=4.0
+pydantic>=2.9,<3
+langchain-core>=0.3

@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint imports (basic)
+        run: |
+          python -c "from tools.arxiv_search.arxiv_search import arxiv_search; print('arxiv_search OK')"
+          python -c "from tools.semantic_scholar_search.semantic_scholar_search import semantic_scholar_search; print('SS OK')"
+          python -c "from tools.openalex_search.openalex_search import openalex_search; print('OpenAlex OK')"
+          python -c "from tools.pdf_extract.pdf_extract import pdf_extract; print('pdf_extract OK')"
+          python -c "from tools.corpus_store.corpus_store import corpus_add_paper, corpus_search, corpus_status, corpus_list_papers, corpus_get_paper; print('corpus_store OK')"
+          python -c "from tools.extract_claims.extract_claims import extract_claims; print('extract_claims OK')"
+          python -c "from tools.verify_citations.verify_citations import verify_citations; print('verify_citations OK')"
+          python -c "from tools.parallel_multi_search.parallel_multi_search import parallel_multi_search; print('parallel OK')"
+          python -c "from tools.self_assess.self_assess import self_assess; print('self_assess OK')"
+          python -c "from schemas.literature_survey_schema import LiteratureSurveySchema; print('schema OK')"
+
+      - name: Run pytest
+        run: pytest tests/ -v -m "not network"
