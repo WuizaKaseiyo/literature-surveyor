@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Use a cheap LLM to extract 5-15 structured claims from a paper in corpus.
+  Persists to claims.jsonl.
+id: extract_claims
+name: extract_claims
+source_talent: literature-surveyor
+type: langchain_module

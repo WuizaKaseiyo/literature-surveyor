@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Search Semantic Scholar (citation-aware). Sorted by citation count —
+  surfaces influential works first.
+id: semantic_scholar_search
+name: semantic_scholar_search
+source_talent: literature-surveyor
+type: langchain_module

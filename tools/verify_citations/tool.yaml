@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Scan markdown for citations and verify each is real (corpus + arxiv/Crossref/Semantic
+  Scholar live check). Final defense against hallucinated cites.
+id: verify_citations
+name: verify_citations
+source_talent: literature-surveyor
+type: langchain_module

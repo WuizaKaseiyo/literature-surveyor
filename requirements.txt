@@ -1,9 +1,20 @@
 # Runtime dependencies — installed when this talent is hired into OMC.
-# Pin loosely; OMC may already have stricter pins for langchain-* etc.
+#
+# IMPORTANT: OMC's onboarding does NOT auto-install talent requirements.txt.
+# All `requests`, `pydantic`, `langchain-core` come from OMC's own pyproject.toml.
+# `pymupdf4llm` + `pypdf` are OPTIONAL — install in OMC venv if you want PDF
+# extraction:
+#   cd /path/to/Memento-Research
+#   .venv/bin/pip install pymupdf4llm pypdf
+# Without them, pdf_extract returns a graceful error message.
+#
+# All other tools (search, corpus, citation verify, schema) work with stdlib only
+# after we replaced `backoff` with an inline retry decorator.
 
-backoff>=2.2,<3
 requests>=2.32,<3
-pymupdf4llm>=0.0.10
-pypdf>=4.0
 pydantic>=2.9,<3
 langchain-core>=0.3
+
+# OPTIONAL — for pdf_extract tool only
+pymupdf4llm>=0.0.10
+pypdf>=4.0

@@ -10,27 +10,49 @@ Set S2_API_KEY env var for higher rate limits (otherwise heavily throttled).
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 import warnings
-from typing import Any
+from typing import Any, Callable
 
-import backoff
 import requests
 from langchain_core.tools import tool
+
+
+def _exp_backoff_retry(
+    exceptions: tuple[type[BaseException], ...],
+    max_tries: int = 5,
+    base_wait_s: float = 1.0,
+) -> Callable:
+    """Stdlib-only exponential backoff decorator (replaces `backoff` library).
+
+    Retries `max_tries` times on the listed exceptions, sleeping
+    base * 2^(attempt-1) seconds between attempts.
+    """
+    def decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc: BaseException | None = None
+            for attempt in range(1, max_tries + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt == max_tries:
+                        break
+                    wait = base_wait_s * (2 ** (attempt - 1))
+                    print(f"[{fn.__name__}] backing off {wait:.1f}s after {attempt} tries: {e}")
+                    time.sleep(wait)
+            if last_exc:
+                raise last_exc
+        return wrapper
+    return decorator
 
 S2_API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 TIMEOUT_S = 20
 MAX_RESULTS_HARD_CAP = 100
 DEFAULT_FIELDS = "title,authors,venue,year,abstract,citationCount,externalIds,openAccessPdf"
-
-
-def _on_backoff(details: dict) -> None:
-    """Log backoff events for visibility."""
-    print(
-        f"[semantic_scholar_search] backing off "
-        f"{details['wait']:0.1f}s after {details['tries']} tries"
-    )
 
 
 @tool
@@ -110,11 +132,10 @@ def semantic_scholar_search(
     }
 
 
-@backoff.on_exception(
-    backoff.expo,
-    (requests.exceptions.HTTPError, requests.exceptions.ConnectionError),
+@_exp_backoff_retry(
+    exceptions=(requests.exceptions.HTTPError, requests.exceptions.ConnectionError),
     max_tries=5,
-    on_backoff=_on_backoff,
+    base_wait_s=1.0,
 )
 def _search_with_backoff(query: str, max_results: int, api_key: str | None) -> list[dict] | None:
     """Hit S2 API with exponential backoff on transient errors."""

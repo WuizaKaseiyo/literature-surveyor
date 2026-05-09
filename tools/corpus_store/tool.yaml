@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Per-project paper corpus with BM25-lite search. 5 actions in one tool
+  group — add, search, status, list, get.
+id: corpus_store
+name: corpus_store
+source_talent: literature-surveyor
+type: langchain_module

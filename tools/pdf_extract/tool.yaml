@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Extract a PDF (URL or local path) to structured markdown. Preserves headings,
+  tables, math.
+id: pdf_extract
+name: pdf_extract
+source_talent: literature-surveyor
+type: langchain_module

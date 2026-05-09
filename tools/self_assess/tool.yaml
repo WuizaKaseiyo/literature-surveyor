@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Decide whether current corpus is sufficient to write the survey. Returns
+  verdict + suggested next action.
+id: self_assess
+name: self_assess
+source_talent: literature-surveyor
+type: langchain_module

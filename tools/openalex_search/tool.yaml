@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Search OpenAlex (240M+ works, all fields, open metadata). Best for cross-domain
+  or older papers.
+id: openalex_search
+name: openalex_search
+source_talent: literature-surveyor
+type: langchain_module

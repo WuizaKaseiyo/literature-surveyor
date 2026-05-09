@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Concurrently query arxiv + Semantic Scholar + OpenAlex. Dedupes by arxiv_id/DOI/title.
+  Returns unified result list.
+id: parallel_multi_search
+name: parallel_multi_search
+source_talent: literature-surveyor
+type: langchain_module

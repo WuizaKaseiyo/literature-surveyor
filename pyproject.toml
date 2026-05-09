@@ -12,12 +12,12 @@ requires-python = ">=3.10"
 authors = [{ name = "Steven", email = "stevenkaseiyo@gmail.com" }]
 
 dependencies = [
-    "backoff>=2.2,<3",
     "requests>=2.32,<3",
-    "pymupdf4llm>=0.0.10",
-    "pypdf>=4.0",
     "pydantic>=2.9,<3",
     "langchain-core>=0.3",
+    # OPTIONAL — pdf_extract tool only; not strictly required:
+    "pymupdf4llm>=0.0.10",
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

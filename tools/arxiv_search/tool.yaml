@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Search arxiv.org for papers (free, no API key). Returns structured metadata
+  sorted by relevance.
+id: arxiv_search
+name: arxiv_search
+source_talent: literature-surveyor
+type: langchain_module
