@@ -1,27 +1,42 @@
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+Talent Market Attribution License (TMAL) v1.0
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+Copyright (c) 2026 Steven (stevenkaseiyo@gmail.com)
 
-       http://www.apache.org/licenses/LICENSE-2.0
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+1. ATTRIBUTION REQUIRED - All copies, forks, modifications, and derivative
+   works MUST retain the "Citation" section in the README file (or equivalent
+   documentation) without modification or removal. This section attributes the
+   original Talent Market template to Talent Market / CarbonKite.
 
-Copyright 2026 Steven (stevenkaseiyo@gmail.com)
+2. CITATION INTEGRITY - The Citation section may not be removed, obscured,
+   hidden, or rendered invisible by any means (including but not limited to
+   CSS, conditional rendering, or relocation to non-visible files).
+
+3. COMMERCIAL USE - Commercial use, modification, and redistribution are
+   expressly permitted, provided the attribution requirements above are met.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ---
 
-ATTRIBUTION (required by Talent Market Attribution License v1.0):
+THIRD-PARTY ATTRIBUTION:
 
-This talent was built using the Talent Market template by Zhengxu Yu /
-1mancompany (https://github.com/1mancompany/talent-template).
+- Built on the Talent Market template by Zhengxu Yu / 1mancompany
+  (https://github.com/1mancompany/talent-template), licensed under TMAL v1.0.
 
-Citation verification and Semantic Scholar tool design adapted from
-SakanaAI/AI-Scientist-v2 (Apache-2.0).
+- Citation verification and Semantic Scholar tool design adapted from
+  SakanaAI/AI-Scientist-v2 (https://github.com/SakanaAI/AI-Scientist-v2),
+  licensed under Apache-2.0. The original Apache-2.0 NOTICE applies to the
+  derived semantic_scholar_search.py file.

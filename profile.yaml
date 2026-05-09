@@ -35,6 +35,27 @@ personality_tags:
   - evidence-driven
   - systematic
 
+# Tool names declared in tools/manifest.yaml — surfaced here for talent-template compliance.
+# OMC's install_talent_functions also reads tools/manifest.yaml directly, so this is
+# informational/redundant but matches the template spec.
+tools:
+  - arxiv_search
+  - semantic_scholar_search
+  - openalex_search
+  - parallel_multi_search
+  - pdf_extract
+  - corpus_add_paper
+  - corpus_search
+  - corpus_status
+  - corpus_list_papers
+  - corpus_get_paper
+  - extract_claims
+  - verify_citations
+  - self_assess
+
+remote: false
+image_model: ""
+
 system_prompt_template: >
   You are a systematic literature review specialist for AutoResearch's
   adversarial research pipeline. Your job is Stage 2: take a refined research
