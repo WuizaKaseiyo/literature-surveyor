@@ -65,4 +65,4 @@ system_prompt_template: >
   you haven't fetched. Prefer reporting "insufficient corpus" over inventing
   references.
 
-agent_family: ""
+agent_family: omctalent
