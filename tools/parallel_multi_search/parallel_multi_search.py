@@ -191,30 +191,77 @@ async def _async_search(
     return out
 
 
-# Wrappers that run sync tools in thread (so we can asyncio.gather them)
+# Wrappers that run sync tools in thread (so we can asyncio.gather them).
+#
+# Sibling-tool resolution strategy (in priority order):
+# 1. OMC runtime: tool_registry.get_tool(name) — when running inside OMC,
+#    sibling tools have already been registered into the asset tool registry
+#    under their @tool names. This is the production path.
+# 2. asset_tool_<folder> in sys.modules — when running inside OMC but the
+#    registry hasn't been populated yet (rare). OMC's load_asset_tools()
+#    imports each tool's .py file as a module named `asset_tool_<folder>`.
+# 3. Local dev path: `from tools.<folder>.<folder>` — works during pytest
+#    when the repo root is on sys.path.
+#
+# This three-tier fallback means parallel_multi_search works:
+#   - Inside OMC after hire (paths 1 or 2)
+#   - In talent-repo pytest (path 3)
+#   - Standalone Python with PYTHONPATH=<repo> (path 3)
+
+
+def _resolve_sibling(tool_name: str, folder: str):
+    """Resolve a sibling @tool. Returns the @tool object or None.
+
+    Tries OMC tool_registry → sys.modules['asset_tool_<folder>'] → local import.
+    """
+    # 1. OMC tool_registry
+    try:
+        from onemancompany.core.tool_registry import tool_registry  # type: ignore
+
+        if t := tool_registry.get_tool(tool_name):
+            return t
+    except Exception:
+        pass
+
+    # 2. sys.modules asset_tool_<folder>
+    import sys
+
+    mod = sys.modules.get(f"asset_tool_{folder}")
+    if mod is not None and hasattr(mod, tool_name):
+        return getattr(mod, tool_name)
+
+    # 3. Local dev fallback
+    try:
+        import importlib
+
+        mod = importlib.import_module(f"tools.{folder}.{folder}")
+        return getattr(mod, tool_name, None)
+    except Exception:
+        return None
 
 
 async def _run_arxiv(query: str, max_results: int) -> dict:
-    from tools.arxiv_search.arxiv_search import arxiv_search  # type: ignore
-
+    tool = _resolve_sibling("arxiv_search", "arxiv_search")
+    if tool is None:
+        return {"results": [], "total": 0, "error": "arxiv_search tool not resolvable"}
     return await asyncio.to_thread(
-        arxiv_search.invoke, {"query": query, "max_results": max_results}
+        tool.invoke, {"query": query, "max_results": max_results}
     )
 
 
 async def _run_ss(query: str, max_results: int) -> dict:
-    from tools.semantic_scholar_search.semantic_scholar_search import (  # type: ignore
-        semantic_scholar_search,
-    )
-
+    tool = _resolve_sibling("semantic_scholar_search", "semantic_scholar_search")
+    if tool is None:
+        return {"results": [], "total": 0, "error": "semantic_scholar_search tool not resolvable"}
     return await asyncio.to_thread(
-        semantic_scholar_search.invoke, {"query": query, "max_results": max_results}
+        tool.invoke, {"query": query, "max_results": max_results}
     )
 
 
 async def _run_openalex(query: str, max_results: int) -> dict:
-    from tools.openalex_search.openalex_search import openalex_search  # type: ignore
-
+    tool = _resolve_sibling("openalex_search", "openalex_search")
+    if tool is None:
+        return {"results": [], "total": 0, "error": "openalex_search tool not resolvable"}
     return await asyncio.to_thread(
-        openalex_search.invoke, {"query": query, "max_results": max_results}
+        tool.invoke, {"query": query, "max_results": max_results}
     )
