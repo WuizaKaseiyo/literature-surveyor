@@ -1,0 +1,8 @@
+added_by: talent:literature-surveyor
+description: Per-run provenance — hashes inputs/prompts, records model identifiers,
+  tracks per-stage wall-clock. 3 actions in one tool group — run_start, run_stage_done,
+  run_finalize. Final artifact lands at <workspace>/run.json for cross-run diff.
+id: run_metadata
+name: run_metadata
+source_talent: literature-surveyor
+type: langchain_module
