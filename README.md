@@ -122,23 +122,30 @@ rm -rf .onemancompany/company/human_resource/employees/00007/
 
 ---
 
-## Tools provided (13)
+## Tools provided (16)
 
 | Tool | Purpose |
 |---|---|
+| **Search & retrieval** | |
 | `arxiv_search` | Search arxiv.org export API — free, no key |
 | `semantic_scholar_search` | Search Semantic Scholar (sorted by citation count) |
 | `openalex_search` | Search OpenAlex (cross-domain, 240M works) |
 | `parallel_multi_search` | Concurrent 3-source search with dedup by arxiv_id/DOI/title |
 | `pdf_extract` | PDF (URL or path) → markdown via pymupdf4llm |
+| **Corpus persistence** | |
 | `corpus_add_paper` | Add paper to project corpus (idempotent) |
 | `corpus_search` | BM25-lite local search over already-fetched papers |
 | `corpus_status` | Counts + distributions; **call first** in Stage 2 |
 | `corpus_list_papers` | List papers with optional source filter |
 | `corpus_get_paper` | Fetch full record by ID |
+| **Quality gates** | |
 | `extract_claims` | LLM-based structured claim extraction (5-15 per paper) |
 | `verify_citations` | Pre-submission cite verification — blocks hallucinations |
 | `self_assess` | Heuristic verdict on whether corpus is sufficient |
+| **Provenance (`run.json`)** | |
+| `run_start` | Begin a run — hash prompts + research question + record model IDs |
+| `run_stage_done` | Record wall-clock per stage (search / pdf_extract / claim_extract / verify / ...) |
+| `run_finalize` | Close out — snapshot corpus size, stamp completion, record output paths |
 
 ## Skills loaded (4)
 
@@ -180,9 +187,12 @@ At Claude Sonnet 4.5 prices (~$3/M input, $15/M output) + gpt-4o-mini for extrac
 |---|---|---|
 | Main ReAct loop (~30 steps) | 200K in / 30K out | $0.60-1.00 |
 | Claim extraction (×30 papers) | 600K in / 60K out | $0.10-0.15 |
+| `run_metadata` calls (× ~7) | <1K total | $0.00 (no LLM, only file I/O) |
 | **Total per survey** | | **~$0.70-1.20** |
 
 Academic API calls (arxiv / S2 / OpenAlex / Crossref) are all free.
+
+If you swap the main model to `anthropic/claude-opus-4.6` (~$15/M input, $75/M output), expect roughly **5×** the main loop cost (~$3.00-5.00 per survey) but better long-context handling of large corpora.
 
 ---
 
@@ -196,7 +206,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-28 unit tests cover all tools (mocked APIs) + Pydantic schema. Run live API tests with `pytest -m network` (hits real arxiv/S2/OpenAlex).
+41 unit tests cover all tools (mocked APIs) + Pydantic schema + run_metadata provenance flow. Run live API tests with `pytest -m network` (hits real arxiv/S2/OpenAlex).
 
 ### Repo layout
 
@@ -219,7 +229,7 @@ literature-surveyor/
 │       └── <name>.py               # @tool implementation(s)
 ├── schemas/                        # Pydantic LiteratureSurveySchema
 ├── examples/                       # Reference surveys (TODO: hand-write 2)
-└── tests/                          # 28 unit tests
+└── tests/                          # 41 unit tests
 ```
 
 ---
@@ -229,7 +239,7 @@ literature-surveyor/
 1. **`pdf_extract` requires extra deps in OMC venv** — `pip install pymupdf4llm pypdf` (graceful degrade to error if missing)
 2. **Corpus directory falls back to `~/.litsurvey_corpus/` if CWD isn't a project workspace** — set `LITSURVEY_CORPUS_DIR` env var to override per-project
 3. **OMC `pipeline_engine` task description still mentions a non-existent `submit_result()` tool** — talent_persona.md teaches the LLM to ignore it; full fix requires a PR to OMC itself
-4. **OMC tool_registry only refreshes on backend start** — after hire, restart the backend (`./scripts/reset.sh --start`) so the 13 talent tools register
+4. **OMC tool_registry only refreshes on backend start** — after hire, restart the backend (`./scripts/reset.sh --start`) so the 16 talent tools register
 5. **Skill matching is dict-order first-wins** — if you keep both old `00007` and new employee with `literature_surveyor` skill, old wins. Use `stage_assignments` or remove old employee.
 
 See [Memento-Research](https://github.com/Memento-Teams/Memento-Research) for OMC architecture details.
@@ -244,14 +254,21 @@ See [Memento-Research](https://github.com/Memento-Teams/Memento-Research) for OM
 | `S2_API_KEY` | recommended | Semantic Scholar higher rate limits |
 | `OPENALEX_MAILTO` | recommended | OpenAlex polite pool |
 | `LITSURVEY_CORPUS_DIR` | optional | Override corpus location (default: `<workspace>/corpus/` or `~/.litsurvey_corpus/`) |
+| `LITSURVEY_RUN_DIR` | optional | Override `run.json` location (default: parent of corpus dir) |
 
 ---
 
 ## Architecture
 
-9 LangChain `@tool` files (exporting 13 tools total — `corpus_store.py` exports 5 sub-tools), 4 folder-based skills, one Pydantic schema, ~3000 LOC including tests. See `prompts/talent_persona.md` for the behavioral contract and `skills/systematic-review/SKILL.md` for the 9-step workflow.
+10 LangChain `@tool` files (exporting **16 tools** total — `corpus_store.py` exports 5 sub-tools, `run_metadata.py` exports 3), 4 folder-based skills, one Pydantic schema, 41 unit tests. See `prompts/talent_persona.md` for the behavioral contract and `skills/systematic-review/SKILL.md` for the 9-step workflow.
 
-Designed to slot into OMC's `pipeline_engine.py` Stage 2 — receives task description from upstream, writes `stage2_literature_surveyor.md` + `stage2.json` to project workspace, returns to pipeline for critic review.
+Designed to slot into OMC's `pipeline_engine.py` Stage 2 — receives task description from upstream, writes three artifacts to the project workspace:
+
+- `stage2.json` — Pydantic-validated `LiteratureSurveySchema`
+- `stage2_literature_surveyor.md` — human-readable render of the schema
+- `run.json` — per-run provenance (prompt hashes, model IDs, stage timings) for cross-run diff
+
+Then returns to pipeline for critic review.
 
 ---
 
