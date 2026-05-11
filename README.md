@@ -163,7 +163,7 @@ Both go through OpenRouter so only `OPENROUTER_API_KEY` is needed.
 To change the main model, edit `profile.yaml`:
 
 ```yaml
-llm_model: anthropic/claude-haiku-4-5    # cheaper alternative
+llm_model: anthropic/claude-opus-4.6     # stronger alternative
 # or
 llm_model: openai/gpt-4o
 ```
