@@ -17,6 +17,10 @@ custom_tools:
   - extract_claims
   - verify_citations
   - self_assess
+  - run_start
+  - run_stage_done
+  - run_finalize
 
-# Note: corpus_store.py defines 5 separate @tool functions (not just one).
-# OMC's loader inspects each .py for @tool decorators and registers each.
+# Note: corpus_store.py defines 5 separate @tool functions, and
+# run_metadata.py defines 3 — OMC's loader inspects each .py for @tool
+# decorators and registers each, so each function gets its own entry above.
