@@ -4,7 +4,7 @@
 
 Systematic literature review specialist for the [AutoResearch](https://github.com/Memento-Teams/Memento-Research) (OneManCompany) adversarial research pipeline. Designed as **Stage 2** — produces evidence-grounded literature surveys with verified citations and identified gaps for downstream Stage 3 idea generation.
 
-> **Talent Market compliant** — packaged per [1mancompany/talent-template](https://github.com/1mancompany/talent-template) v1. **End-to-end verified** in a real OMC instance (28 unit tests + integration sandbox + live hire).
+> **Talent Market compliant** — packaged per [1mancompany/talent-template](https://github.com/1mancompany/talent-template) v1. **End-to-end verified** in a real OMC instance (41 unit tests + integration sandbox + live hire).
 
 ---
 
