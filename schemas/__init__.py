@@ -1,5 +1,7 @@
 from .literature_survey_schema import (
     CitationRef,
+    AttributionAuditItem,
+    AttributionAuditSummary,
     Conflict,
     CorpusSummary,
     Finding,
@@ -13,6 +15,8 @@ from .literature_survey_schema import (
 
 __all__ = [
     "CitationRef",
+    "AttributionAuditItem",
+    "AttributionAuditSummary",
     "Conflict",
     "CorpusSummary",
     "Finding",

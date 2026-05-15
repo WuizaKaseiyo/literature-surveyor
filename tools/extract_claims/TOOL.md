@@ -30,6 +30,8 @@ Each claim:
     "claim_text": "PPO-RLHF reduces TruthfulQA hallucination from 42% to 29% in Llama-7B",
     "claim_type": "factual",       # factual | methodological | negative_result | conjecture
     "evidence_span": "Section 4.2, Table 3",
+    "evidence_quote": "The hallucination rate decreased from 42% to 29%...",
+    "source_section": "Section 4.2",
     "confidence": 0.85,            # paper's own confidence
     "applies_to": "models 7B-13B, English only",
     "extracted_at": 1700000000.0,

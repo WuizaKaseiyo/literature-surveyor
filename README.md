@@ -4,7 +4,7 @@
 
 Systematic literature review specialist for the [AutoResearch](https://github.com/Memento-Teams/Memento-Research) (OneManCompany) adversarial research pipeline. Designed as **Stage 2** — produces evidence-grounded literature surveys with verified citations and identified gaps for downstream Stage 3 idea generation.
 
-> **Talent Market compliant** — packaged per [1mancompany/talent-template](https://github.com/1mancompany/talent-template) v1. **End-to-end verified** in a real OMC instance (41 unit tests + integration sandbox + live hire).
+> **Talent Market compliant** — packaged per [1mancompany/talent-template](https://github.com/1mancompany/talent-template) v1. **End-to-end verified** in a real OMC instance (unit tests + integration sandbox + live hire).
 
 ---
 
@@ -15,7 +15,7 @@ Systematic literature review specialist for the [AutoResearch](https://github.co
 - **Per-project corpus** — append-only `papers.jsonl` + BM25-lite index; reusable across rounds
 - **Structured claim extraction** — each paper → 5-15 typed claims with `evidence_span` (section + table refs) + `applies_to` (scope qualifier)
 - **Cross-paper conflict detection** — finds same-setting / contradictory claims (4 levels: direct / methodological / scope / temporal)
-- **Citation verification** — every `[Author Year, arxiv:X / doi:Y / S2:Z]` cite checked against real APIs; hallucinated IDs blocked pre-submission
+- **Citation verification + attribution fact check** — every `[Author Year, arxiv:X / doi:Y / S2:Z]` cite checked against real APIs, then each final-text claim is checked against the cited paper
 - **Pydantic-validated output** — strict `LiteratureSurveySchema` JSON + rendered markdown
 
 ## Why use this instead of asking GPT directly
@@ -43,8 +43,8 @@ OMC's onboarding flow will:
 1. `git clone` this repo into `.onemancompany/talents/literature-surveyor/`
 2. `execute_hire()` creates a new employee directory (e.g. `00015`)
 3. `copy_talent_assets` copies skills/prompts/vessel/manifest into the employee
-4. `register_tool_user` puts 9 tool dirs into `company/assets/tools/` (with `tool.yaml` for tool_registry registration)
-5. `tool_registry.load_asset_tools()` registers 13 LangChain `@tool` functions on next backend start
+4. `register_tool_user` puts 11 tool dirs into `company/assets/tools/` (with `tool.yaml` for tool_registry registration)
+5. `tool_registry.load_asset_tools()` registers 17 LangChain `@tool` functions on next backend start
 6. Backend registers a LangChain agent for the new employee
 
 ### Or, programmatic install
@@ -59,7 +59,7 @@ curl -X POST http://localhost:8000/api/candidates/hire-from-cv \
       "talent_id": "literature-surveyor",
       "source_repo": "https://github.com/WuizaKaseiyo/literature-surveyor",
       "skills": ["literature_surveyor", "systematic-review", "claim-extraction", "conflict-detection", "citation-verification"],
-      "llm_model": "anthropic/claude-sonnet-4-5",
+      "llm_model": "anthropic/claude-opus-4.6",
       "temperature": 0.3,
       "hosting": "company",
       "auth_method": "api_key",
@@ -122,7 +122,7 @@ rm -rf .onemancompany/company/human_resource/employees/00007/
 
 ---
 
-## Tools provided (16)
+## Tools provided (17)
 
 | Tool | Purpose |
 |---|---|
@@ -141,6 +141,7 @@ rm -rf .onemancompany/company/human_resource/employees/00007/
 | **Quality gates** | |
 | `extract_claims` | LLM-based structured claim extraction (5-15 per paper) |
 | `verify_citations` | Pre-submission cite verification — blocks hallucinations |
+| `fact_check_rendered_survey` | Final markdown attribution fact check — verifies cited papers support each sentence-level claim |
 | `self_assess` | Heuristic verdict on whether corpus is sufficient |
 | **Provenance (`run.json`)** | |
 | `run_start` | Begin a run — hash prompts + research question + record model IDs |
@@ -162,7 +163,7 @@ By default the talent uses **two models** for cost optimization:
 
 | Component | Model | Why |
 |---|---|---|
-| Main reasoning (90% of calls) | `anthropic/claude-sonnet-4-5` | Long-context + structured reasoning for surveys |
+| Main reasoning (90% of calls) | `anthropic/claude-opus-4.6` | Stronger long-context reasoning for high-stakes surveys |
 | Claim extraction (per paper) | `openai/gpt-4o-mini` | Cheap structured extraction, ~10× cost reduction |
 
 Both go through OpenRouter so only `OPENROUTER_API_KEY` is needed.
@@ -170,7 +171,7 @@ Both go through OpenRouter so only `OPENROUTER_API_KEY` is needed.
 To change the main model, edit `profile.yaml`:
 
 ```yaml
-llm_model: anthropic/claude-opus-4.6     # stronger alternative
+llm_model: anthropic/claude-sonnet-4-5   # cheaper alternative
 # or
 llm_model: openai/gpt-4o
 ```
@@ -192,7 +193,7 @@ At Claude Sonnet 4.5 prices (~$3/M input, $15/M output) + gpt-4o-mini for extrac
 
 Academic API calls (arxiv / S2 / OpenAlex / Crossref) are all free.
 
-If you swap the main model to `anthropic/claude-opus-4.6` (~$15/M input, $75/M output), expect roughly **5×** the main loop cost (~$3.00-5.00 per survey) but better long-context handling of large corpora.
+The default `anthropic/claude-opus-4.6` is the stronger setting. Swapping to `anthropic/claude-sonnet-4-5` should reduce the main loop cost substantially, with weaker long-context handling on large corpora.
 
 ---
 
@@ -206,7 +207,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-41 unit tests cover all tools (mocked APIs) + Pydantic schema + run_metadata provenance flow. Run live API tests with `pytest -m network` (hits real arxiv/S2/OpenAlex).
+Unit tests cover core tools (mocked APIs), attribution fact checking, Pydantic schema, and run_metadata provenance flow. Run live API tests with `pytest -m network` (hits real arxiv/S2/OpenAlex).
 
 ### Repo layout
 
@@ -229,7 +230,7 @@ literature-surveyor/
 │       └── <name>.py               # @tool implementation(s)
 ├── schemas/                        # Pydantic LiteratureSurveySchema
 ├── examples/                       # Reference surveys (TODO: hand-write 2)
-└── tests/                          # 41 unit tests
+└── tests/                          # unit tests
 ```
 
 ---
@@ -260,7 +261,7 @@ See [Memento-Research](https://github.com/Memento-Teams/Memento-Research) for OM
 
 ## Architecture
 
-10 LangChain `@tool` files (exporting **16 tools** total — `corpus_store.py` exports 5 sub-tools, `run_metadata.py` exports 3), 4 folder-based skills, one Pydantic schema, 41 unit tests. See `prompts/talent_persona.md` for the behavioral contract and `skills/systematic-review/SKILL.md` for the 9-step workflow.
+11 LangChain `@tool` files (exporting **17 tools** total — `corpus_store.py` exports 5 sub-tools, `run_metadata.py` exports 3), 4 folder-based skills, one Pydantic schema, and focused unit tests. See `prompts/talent_persona.md` for the behavioral contract and `skills/systematic-review/SKILL.md` for the 9-step workflow.
 
 Designed to slot into OMC's `pipeline_engine.py` Stage 2 — receives task description from upstream, writes three artifacts to the project workspace:
 

@@ -16,6 +16,7 @@ custom_tools:
   - corpus_get_paper
   - extract_claims
   - verify_citations
+  - fact_check_rendered_survey
   - self_assess
   - run_start
   - run_stage_done

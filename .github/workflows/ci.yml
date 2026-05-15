@@ -36,6 +36,7 @@ jobs:
           python -c "from tools.corpus_store.corpus_store import corpus_add_paper, corpus_search, corpus_status, corpus_list_papers, corpus_get_paper; print('corpus_store OK')"
           python -c "from tools.extract_claims.extract_claims import extract_claims; print('extract_claims OK')"
           python -c "from tools.verify_citations.verify_citations import verify_citations; print('verify_citations OK')"
+          python -c "from tools.fact_check_rendered_survey.fact_check_rendered_survey import fact_check_rendered_survey; print('fact_check_rendered_survey OK')"
           python -c "from tools.parallel_multi_search.parallel_multi_search import parallel_multi_search; print('parallel OK')"
           python -c "from tools.self_assess.self_assess import self_assess; print('self_assess OK')"
           python -c "from schemas.literature_survey_schema import LiteratureSurveySchema; print('schema OK')"

@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from schemas.literature_survey_schema import (
+    AttributionAuditItem,
+    AttributionAuditSummary,
     CitationRef,
     Conflict,
     CorpusSummary,
@@ -126,3 +128,21 @@ def test_serialize_roundtrip():
     json_str = survey.model_dump_json()
     parsed = LiteratureSurveySchema.model_validate_json(json_str)
     assert parsed.research_question == survey.research_question
+
+
+def test_attribution_audit_schema():
+    item = AttributionAuditItem(
+        claim_text="X improves Y.",
+        citation_raw="[Smith et al. 2024, arxiv:2401.12345]",
+        citation_kind="arxiv",
+        citation_id="2401.12345",
+        verdict="supported",
+        confidence=0.8,
+    )
+    audit = AttributionAuditSummary(supported_count=1, total_checked=1, items=[item])
+    assert audit.items[0].verdict == "supported"
+
+    bad = item.model_dump()
+    bad["verdict"] = "looks_fine"
+    with pytest.raises(ValidationError):
+        AttributionAuditItem(**bad)

@@ -120,21 +120,30 @@ load_skill('conflict-detection')
 ## 9. 自检（必须）
 
 ```
-result = verify_citations(read('stage2_literature_surveyor.md'))
+cite_result = verify_citations(read('stage2_literature_surveyor.md'))
+fact_result = fact_check_rendered_survey(read('stage2_literature_surveyor.md'), use_llm=True)
 ```
 
-如果 `result.unverified_count > 0`：
+如果 `cite_result.unverified_count > 0`：
 1. 看哪些 cite 失败
 2. 删掉这些 cite + 对应 claim，或者用 corpus_search 找替代
 3. 重新 verify
 4. 直到 unverified_count == 0
 
+如果 `fact_result.blocking_count > 0`：
+1. 对每条 `unsupported` / `contradicted` / `source_irrelevant` 找到对应句子
+2. 删除、改写、或换成真正支持该句的 citation
+3. `partially_supported` 必须降级措辞（如 "shows" → "suggests"）
+4. 重新运行 `fact_check_rendered_survey`，直到 blocking_count == 0
+
 ## 严禁
 
 - 编造 arxiv_id 或 cite text
 - 跳过 step 9 的 verify_citations
+- 跳过最终文本的 fact_check_rendered_survey
 - 输出超过 30 篇 paper（不是越多越好）
 - 报告里出现没 cite 的 claim
+- 报告里出现 citation 真实但不支持该句的 claim
 - 跟 critic 辩论 — critic reject = 改
 
 ## 范例

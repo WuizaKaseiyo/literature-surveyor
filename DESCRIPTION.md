@@ -9,7 +9,7 @@ Built for **AutoResearch's adversarial research pipeline** (Stage 2: Literature 
 - **Structured survey JSON** (Pydantic-validated) — taxonomy, findings, conflicts, open questions, gaps
 - **Human-readable markdown** — rendered from the JSON
 - **Per-project corpus** (`corpus.jsonl`) — papers + claims persisted for retry / downstream stages
-- **Citation audit** — every cite verified against arxiv / Semantic Scholar / OpenAlex; unverified blocked
+- **Citation audit** — every cite verified against arxiv / Semantic Scholar / OpenAlex, then final claims are checked against cited source text
 
 ## Use Cases
 
@@ -23,6 +23,7 @@ Built for **AutoResearch's adversarial research pipeline** (Stage 2: Literature 
 | Vanilla LLM | This talent |
 |---|---|
 | Invents arxiv IDs | `verify_citations` tool blocks pre-submission |
+| Cites real but wrong papers | `fact_check_rendered_survey` checks final claims against cited paper text |
 | Knowledge cuts off at training | Live arxiv / Semantic Scholar / OpenAlex APIs |
 | Free-form prose | Pydantic schema enforces structure |
 | Forgets between conversations | Per-project corpus.jsonl persists |
@@ -33,9 +34,9 @@ Built for **AutoResearch's adversarial research pipeline** (Stage 2: Literature 
 
 ## Tools Provided
 
-9 LangChain `@tool` functions, all auto-installed on hire:
+17 LangChain `@tool` functions, all auto-installed on hire:
 
-`arxiv_search`, `semantic_scholar_search`, `openalex_search`, `parallel_multi_search`, `pdf_extract`, `corpus_store` (5 actions: add/search/status/list/get), `extract_claims`, `verify_citations`, `self_assess`.
+`arxiv_search`, `semantic_scholar_search`, `openalex_search`, `parallel_multi_search`, `pdf_extract`, `corpus_store` (5 actions: add/search/status/list/get), `extract_claims`, `verify_citations`, `fact_check_rendered_survey`, `self_assess`, `run_metadata` (3 actions: start/stage_done/finalize).
 
 ## Skills Loaded
 

@@ -1,8 +1,7 @@
-"""self_assess — Heuristic + LLM hybrid: is the corpus sufficient to write the survey?
+"""self_assess — Heuristic check: is the corpus sufficient to write the survey?
 
-Combines:
-  - hard heuristics (paper count, year coverage, source diversity)
-  - LLM judgment (relevance, gap coverage)
+Combines hard heuristics: paper count, year coverage, source diversity, and
+full-text coverage.
 
 Used by the talent in the middle of Stage 2 to decide:
   - keep searching (corpus too thin)
@@ -51,6 +50,25 @@ def _load_papers() -> list[dict]:
     return out
 
 
+def _claim_paper_ids() -> set[str]:
+    path = _corpus_dir() / "claims.jsonl"
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                claim = json.loads(line)
+                if pid := claim.get("paper_id"):
+                    out.add(str(pid))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
 @tool
 def self_assess(
     research_question: str,
@@ -86,12 +104,14 @@ def self_assess(
     by_source = Counter(p.get("source", "unknown") for p in papers)
     by_year = Counter(int(p["year"]) for p in papers if isinstance(p.get("year"), int))
     with_full = sum(1 for p in papers if p.get("full_text_md"))
+    papers_with_claims = _claim_paper_ids()
 
     metrics = {
         "paper_count": n,
         "year_spread": len(by_year),
         "source_diversity": len(by_source),
         "with_full_text": with_full,
+        "papers_with_claims": len(papers_with_claims),
         "by_source": dict(by_source),
         "by_year": dict(by_year),
     }
@@ -144,6 +164,10 @@ def self_assess(
     if with_full / max(n, 1) < 0.6:
         quality_warnings.append(
             f"only {with_full}/{n} papers have full text — claim extraction will be weaker"
+        )
+    if papers_with_claims and len(papers_with_claims) / max(n, 1) < 0.7:
+        quality_warnings.append(
+            f"only {len(papers_with_claims)}/{n} papers have extracted claims — final fact check coverage may be weak"
         )
 
     return {

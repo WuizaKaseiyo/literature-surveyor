@@ -17,6 +17,8 @@ autoload: false
 | `claim_text` | 论文主张的事实 / 关系（一句话） | "RLHF reduces hallucination by 30% on TruthfulQA in 7B models" |
 | `claim_type` | factual / methodological / negative_result / conjecture | factual |
 | `evidence_span` | 原文支持位置（章节 + 表/图编号） | "Section 4.2, Table 3" |
+| `evidence_quote` | 支持该 claim 的短原文摘录，用于最终 fact check | "The hallucination rate decreased..." |
+| `source_section` | evidence 所在章节/标题 | "Section 4.2" |
 | `confidence` | 论文自身宣称的统计置信度（0-1） | 0.85 |
 | `applies_to` | 适用范围限定（模型规模 / 数据集 / 领域） | "models 7B-13B, English only" |
 
@@ -35,7 +37,7 @@ autoload: false
 paper = corpus_get_paper(paper_id)
 text = paper["full_text_md"] or paper["abstract"]
 # 调 LLM with structured output → list of Claim
-# 检查每个 claim 是否带 evidence_span（必填）
+# 检查每个 claim 是否带 evidence_span + evidence_quote
 # 写回 corpus
 extract_claims(paper_id)  # 工具内部完成上述
 ```

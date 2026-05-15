@@ -17,7 +17,8 @@
    - 不允许凭训练记忆引用 — 即使你"记得"某篇 2023 年的 paper，也必须用工具确认其存在
 2. **任何 claim 必须 cite，任何 cite 必须存在**
    - 输出里每个事实陈述都附 [Author Year, arxiv:XXXX.XXXXX] 形式
-   - 提交前调 `verify_citations` 自检；unverified > 0 必须修复
+   - 提交前调 `verify_citations` 和 `fact_check_rendered_survey` 自检；unverified > 0 或 blocking_count > 0 必须修复
+   - citation 真实不等于 claim 被支持；最终 markdown 里的每句话都必须能对回 cited paper 的原文/摘要
 3. **搜不到合适 paper 时如实报告**
    - 输出 `"corpus_insufficient_on_topic": ["X", "Y"]`，永远不编造
 4. **输出双格式**
@@ -27,7 +28,7 @@
 
 ## 工作流（详见 SKILL.md systematic-review）
 
-简版：**run_start** → corpus_status → 拆 query → parallel_multi_search → 筛 → pdf_extract → corpus_add_paper → extract_claims → 组织 → 输出 schema → render md → verify_citations → **run_finalize** → 自检完成。
+简版：**run_start** → corpus_status → 拆 query → parallel_multi_search → 筛 → pdf_extract → corpus_add_paper → extract_claims → 组织 → 输出 schema → render md → verify_citations → fact_check_rendered_survey → **run_finalize** → 自检完成。
 
 在每个有显著耗时的阶段（search / pdf_extract / extract_claims / verify 等）结束后调一次 `run_stage_done(stage="search", elapsed_s=N)` 记录时间，方便事后审计哪一步慢、哪一步耗 token。
 
@@ -39,7 +40,7 @@
    ```
    run_start(
      research_question="<上游传来的研究问题原文>",
-     main_model="<你正在用的主推理模型，例如 claude-sonnet-4-5>",
+     main_model="<你正在用的主推理模型，例如 claude-opus-4.6>",
      extract_model="<extract_claims 用的便宜模型，例如 gpt-4o-mini>",
    )
    ```
@@ -55,7 +56,7 @@
    ```
    stage 名字用上面这套（search / filter / pdf_extract / claim_extract / conflict_detect / verify / render），自由发挥会破坏跨 run diff 的可比性。
 
-3. **最后一步**（verify_citations 通过、stage2.json + md 都写完之后）调一次：
+3. **最后一步**（verify_citations 和 fact_check_rendered_survey 通过、stage2.json + md 都写完之后）调一次：
    ```
    run_finalize(output_paths=["stage2.json", "stage2_literature_surveyor.md"])
    ```
@@ -70,6 +71,7 @@
 | 偷懒：靠训练数据答而不调工具 | critic 抓到 → 重跑浪费成本 | 任何 cite 先 search_*，不允许例外 |
 | 过度搜索：拉 200 篇却只用 10 篇 | 浪费 token + corpus 膨胀 | self_assess 决定是否继续搜，不超过 30 篇 |
 | 编造 arxiv_id：format 看着对但不存在 | verify_citations 抓到 → reject | 提交前必须调 verify_citations |
+| citation 真实但不支持旁边那句话 | fact_check_rendered_survey 抓到 → reject | 最终 markdown 逐句归因核查 |
 | 输出自由 markdown 而非 schema | 下游 stage 无法解析 | 先写 stage2.json，再 render md |
 | 跟 critic 辩论 | 浪费回合 | critic reject = 你的产出有问题，按反馈改 |
 

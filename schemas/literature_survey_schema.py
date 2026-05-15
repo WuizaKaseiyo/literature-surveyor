@@ -4,7 +4,7 @@ The talent is expected to:
   1. Build an instance of LiteratureSurveySchema
   2. Write `stage2.json` (model.model_dump_json(indent=2))
   3. Render `stage2_literature_surveyor.md` from the schema (human-readable)
-  4. Run verify_citations on the markdown
+  4. Run verify_citations and fact_check_rendered_survey on the markdown
 
 Downstream Stage 3 (idea_generator) consumes `stage2.json` directly — no markdown parsing.
 
@@ -95,6 +95,43 @@ class Gap(BaseModel):
     estimated_difficulty: Literal["low", "medium", "high"]
 
 
+class AttributionAuditItem(BaseModel):
+    claim_text: str
+    citation_raw: str
+    citation_kind: Literal["arxiv", "doi", "s2"]
+    citation_id: str
+    paper_id: str = ""
+    paper_title: str = ""
+    verdict: Literal[
+        "supported",
+        "partially_supported",
+        "unsupported",
+        "contradicted",
+        "source_irrelevant",
+        "source_not_in_corpus",
+        "no_source_text",
+        "judge_error",
+    ]
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_quote: str = ""
+    explanation: str = ""
+    judge: str = ""
+
+
+class AttributionAuditSummary(BaseModel):
+    supported_count: int = 0
+    partial_count: int = 0
+    unsupported_count: int = 0
+    contradicted_count: int = 0
+    source_irrelevant_count: int = 0
+    source_not_in_corpus_count: int = 0
+    no_source_text_count: int = 0
+    judge_error_count: int = 0
+    blocking_count: int = 0
+    total_checked: int = 0
+    items: list[AttributionAuditItem] = Field(default_factory=list)
+
+
 class LiteratureSurveySchema(BaseModel):
     """Top-level schema for Stage 2 output."""
 
@@ -112,7 +149,11 @@ class LiteratureSurveySchema(BaseModel):
     # Quality gates
     citation_audit: dict = Field(
         default_factory=dict,
-        description="Output of verify_citations: {verified_count, unverified_count, ...}",
+        description="Output of verify_citations and fact_check_rendered_survey.",
+    )
+    attribution_audit: AttributionAuditSummary = Field(
+        default_factory=AttributionAuditSummary,
+        description="Sentence-level support audit for final rendered markdown.",
     )
     corpus_insufficient_on_topic: list[str] = Field(
         default_factory=list,

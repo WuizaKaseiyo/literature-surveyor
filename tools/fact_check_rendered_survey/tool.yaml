@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Fact-check final rendered Markdown claims against the cited papers in corpus.
+  Verifies that each sentence-level claim is supported by its citation, not just that the citation exists.
+id: fact_check_rendered_survey
+name: fact_check_rendered_survey
+source_talent: literature-surveyor
+type: langchain_module

@@ -6,20 +6,24 @@ autoload: false
 
 # Citation Verification
 
-提交 stage2 之前**必须**调 `verify_citations` —— 这是 talent 内部的最后一道防幻觉关卡，比下游 critic 更早抓 bug。
+提交 stage2 之前**必须**调 `verify_citations` 和 `fact_check_rendered_survey`。
+
+`verify_citations` 检查 citation 对象是否真实存在；`fact_check_rendered_survey`
+检查最终 markdown 中每个句子级 claim 是否真的被它旁边的 citation 支持。
 
 ## 流程
 
 ```python
 md_text = read('stage2_literature_surveyor.md')
-result = verify_citations(md_text)
+cite_result = verify_citations(md_text)
+fact_result = fact_check_rendered_survey(md_text, use_llm=True)
 
-if result["unverified_count"] == 0:
+if cite_result["unverified_count"] == 0 and fact_result["blocking_count"] == 0:
     # 提交
     pass
 else:
     # 修复
-    for cite in result["unverified"]:
+    for cite in cite_result["unverified"]:
         # 选项 A：在 corpus 中找替代真实 paper
         alt = corpus_search(cite["context_around"])
         if alt:
@@ -27,8 +31,14 @@ else:
         # 选项 B：删除该 cite + 对应 claim
         else:
             remove_claim_with_cite(cite["raw"])
+    for item in fact_result["items"]:
+        if item["verdict"] in ["unsupported", "contradicted", "source_irrelevant"]:
+            rewrite_or_remove_claim(item["claim_text"])
+        elif item["verdict"] == "partially_supported":
+            soften_wording(item["claim_text"])
     # 重新 verify
-    result = verify_citations(read('stage2_literature_surveyor.md'))
+    cite_result = verify_citations(read('stage2_literature_surveyor.md'))
+    fact_result = fact_check_rendered_survey(read('stage2_literature_surveyor.md'), use_llm=True)
 ```
 
 ## 引用格式（统一）
@@ -65,10 +75,34 @@ else:
 }
 ```
 
+## fact_check_rendered_survey 返回结构
+
+```json
+{
+  "supported_count": 20,
+  "partial_count": 3,
+  "unsupported_count": 1,
+  "contradicted_count": 0,
+  "source_irrelevant_count": 0,
+  "source_not_in_corpus_count": 0,
+  "blocking_count": 1,
+  "items": [
+    {
+      "claim_text": "RLHF reduces hallucination by 30% in 7B models.",
+      "citation_raw": "[Smith et al. 2024, arxiv:2401.12345]",
+      "paper_id": "2401.12345",
+      "verdict": "unsupported",
+      "evidence_quote": "...",
+      "explanation": "The source is about RLHF but does not contain the 30% value."
+    }
+  ]
+}
+```
+
 ## 失败处理优先级
 
 如果 unverified > 5：很可能你之前没用 search_* 工具就开始写。回到 step 5 重新爬 paper。
 
 如果 unverified 1-5：逐个修复（替代或删除）。
 
-如果 verify_citations 工具自身报错（API down 等）：报 `verification_skipped: <reason>` 在 stage2.json 里，但**不要直接提交** — 这是 critic 必 reject 的情况。
+如果 verify_citations 或 fact_check_rendered_survey 工具自身报错：报 `verification_skipped: <reason>` 在 stage2.json 里，但**不要直接提交** — 这是 critic 必 reject 的情况。

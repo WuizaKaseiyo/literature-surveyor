@@ -33,6 +33,8 @@ class Claim(BaseModel):
     claim_text: str = Field(description="One-sentence factual statement from the paper")
     claim_type: str = Field(description="factual | methodological | negative_result | conjecture")
     evidence_span: str = Field(description="Section + table/figure reference, e.g. 'Section 4.2, Table 3'")
+    evidence_quote: str = Field(default="", description="Short verbatim source quote supporting the claim")
+    source_section: str = Field(default="", description="Section name or heading containing the evidence")
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     applies_to: str = Field(
         default="", description="Scope: model size, dataset, domain — used by conflict detection"
@@ -103,6 +105,8 @@ def _call_llm_for_claims(paper_text: str, paper_meta: dict, model: str) -> list[
         '  claim_text (string, one sentence),\n'
         '  claim_type (one of: factual, methodological, negative_result, conjecture),\n'
         '  evidence_span (string, e.g. "Section 4.2, Table 3"),\n'
+        '  evidence_quote (string, one short quote from the source text that supports the claim),\n'
+        '  source_section (string, section or heading where the evidence appears),\n'
         '  confidence (float 0-1, paper\'s own claimed confidence),\n'
         '  applies_to (string, scope qualifier like "models 7B-13B, English only").\n\n'
         "Return ONLY the JSON array, nothing else."
@@ -234,6 +238,8 @@ def extract_claims(
                     "claim_text": c.claim_text,
                     "claim_type": c.claim_type,
                     "evidence_span": c.evidence_span,
+                    "evidence_quote": c.evidence_quote,
+                    "source_section": c.source_section,
                     "confidence": c.confidence,
                     "applies_to": c.applies_to,
                     "extracted_at": time.time(),
