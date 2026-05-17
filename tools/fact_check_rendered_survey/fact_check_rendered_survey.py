@@ -584,15 +584,68 @@ def _check_claim_against_paper(
     return result
 
 
-def _summary(items: list[dict]) -> dict[str, Any]:
+# Rank used to roll per-cite verdicts up to a per-attribution verdict.
+# An attribution is blocking iff its FINAL (rolled-up) verdict is non-supportive.
+# Rationale: when a talent writes `X [a][b]`, if [a] supports X, the attribution
+# is backed even if [b] doesn't — the talent just added an extra reference. The
+# per-cite detail is preserved in `items` so genuine cite-misattribution is
+# still discoverable on inspection.
+_VERDICT_RANK = {
+    "supported": 6,
+    "partially_supported": 5,
+    "contradicted": 4,
+    "unsupported": 3,
+    "source_irrelevant": 2,
+    "source_not_in_corpus": 1,
+    "no_source_text": 0,
+    "judge_error": -1,
+}
+_NON_BLOCKING = {"supported", "partially_supported"}
+
+
+def _aggregate_attributions(items: list[dict]) -> list[dict]:
+    """Group per-cite items by attribution_id; pick the most-supportive verdict
+    per group as the attribution's final verdict.
+
+    Items missing attribution_id (shouldn't happen, but defensive) are treated
+    as singleton groups keyed by their index.
+    """
+    groups: dict[str, list[dict]] = {}
+    for i, it in enumerate(items):
+        key = it.get("attribution_id") or f"_anon_{i}"
+        groups.setdefault(key, []).append(it)
+
+    per_attr: list[dict] = []
+    for attr_id, sub in groups.items():
+        best = max(sub, key=lambda x: _VERDICT_RANK.get(x.get("verdict", "judge_error"), -1))
+        per_attr.append({
+            "attribution_id": attr_id,
+            "claim_text": best.get("claim_text", ""),
+            "final_verdict": best.get("verdict", "judge_error"),
+            "final_matched_claim_id": best.get("matched_claim_id", ""),
+            "sub_results": [
+                {
+                    "citation_raw": s.get("citation_raw", ""),
+                    "citation_id": s.get("citation_id", ""),
+                    "paper_id": s.get("paper_id", ""),
+                    "verdict": s.get("verdict", ""),
+                    "confidence": s.get("confidence", 0.0),
+                    "judge": s.get("judge", ""),
+                }
+                for s in sub
+            ],
+        })
+    return per_attr
+
+
+def _summary(items: list[dict], per_attribution: list[dict]) -> dict[str, Any]:
+    """Aggregate counts. Per-cite item counts are reported for backward compat;
+    the canonical `blocking_count` is now per-attribution (the gate talent should
+    actually act on)."""
     counts = Counter(item.get("verdict", "judge_error") for item in items)
-    blocking = (
-        counts.get("unsupported", 0)
-        + counts.get("contradicted", 0)
-        + counts.get("source_irrelevant", 0)
-        + counts.get("source_not_in_corpus", 0)
-        + counts.get("no_source_text", 0)
-        + counts.get("judge_error", 0)
+    attr_counts = Counter(a.get("final_verdict", "judge_error") for a in per_attribution)
+    blocking_attributions = sum(
+        n for v, n in attr_counts.items() if v not in _NON_BLOCKING
     )
     return {
         "supported_count": counts.get("supported", 0),
@@ -603,8 +656,21 @@ def _summary(items: list[dict]) -> dict[str, Any]:
         "source_not_in_corpus_count": counts.get("source_not_in_corpus", 0),
         "no_source_text_count": counts.get("no_source_text", 0),
         "judge_error_count": counts.get("judge_error", 0),
-        "blocking_count": blocking,
+        # Backward-compat: legacy `blocking_count` was the per-cite count.
+        # New canonical: blocking attributions = attributions whose ROLLED-UP
+        # verdict is non-supportive. Talent should check `blocking_count` (now
+        # the attribution one); `blocking_cite_count` is the legacy view.
+        "blocking_count": blocking_attributions,
+        "blocking_cite_count": (
+            counts.get("unsupported", 0)
+            + counts.get("contradicted", 0)
+            + counts.get("source_irrelevant", 0)
+            + counts.get("source_not_in_corpus", 0)
+            + counts.get("no_source_text", 0)
+            + counts.get("judge_error", 0)
+        ),
         "total_checked": len(items),
+        "total_attributions": len(per_attribution),
     }
 
 
@@ -644,10 +710,11 @@ def fact_check_rendered_survey(
         }
     """
     if not markdown:
-        empty = _summary([])
+        empty = _summary([], [])
         return {
             **empty,
             "items": [],
+            "per_attribution": [],
             "parsed_attributions": 0,
             "verification_method": "final markdown attribution fact check",
         }
@@ -692,10 +759,12 @@ def fact_check_rendered_survey(
         if len(items) >= max(1, min(int(max_checks), 1000)):
             break
 
-    summary = _summary(items)
+    per_attribution = _aggregate_attributions(items)
+    summary = _summary(items, per_attribution)
     return {
         **summary,
         "items": items,
+        "per_attribution": per_attribution,
         "parsed_attributions": len(attributions),
         "corpus_size": len(papers),
         "checked_at": time.time(),

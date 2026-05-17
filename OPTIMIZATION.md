@@ -163,11 +163,12 @@
 - [ ] 容差：`abs(a-b)/max(|a|,|b|) <= 0.05` 视为命中
 - [ ] 差值匹配：`_extract_diffs(text)` 抽相邻百分比差值，支持 "reduced by 13pp" 对应 `42% → 29%`
 
-### E3. 多 cite 聚合
-- [ ] 按 `attribution_id` 聚合 cite，最终 verdict = `max(verdicts)`（按 supported > partial > unsupported > contradicted）
-- [ ] `blocking_count` 按聚合后统计
-- [ ] 输出额外 `per_attribution: [{attribution_id, final_verdict, sub_results}]`
-- [ ] 单 cite 细节仍在 `items` 里保留
+### E3. 多 cite 聚合 —— ✅ 完成
+- [x] 按 `attribution_id` 聚合 cite，最终 verdict = 按 supported > partial > contradicted > unsupported > ... rank 取 best
+- [x] `blocking_count` 改为按聚合后的 attribution 统计；旧的 per-cite 数字保留为 `blocking_cite_count`（backward compat）
+- [x] 输出额外 `per_attribution: [{attribution_id, claim_text, final_verdict, final_matched_claim_id, sub_results}]`
+- [x] 单 cite 细节仍在 `items` 里保留
+- [x] 3 个新测试（多 cite 一对一错 → non-blocking / 多 cite 全错 → blocking / 单 cite backward compat）+ 老 fact_check 测试 0 改动通过
 
 ### E4. `source_not_in_corpus` 主动回填（可选）
 - [ ] 新参 `auto_fetch_missing: bool = False`

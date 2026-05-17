@@ -52,4 +52,19 @@ audit = fact_check_rendered_survey(
 - `source_not_in_corpus_count > 0`: add/fetch paper or remove citation
 - `partial_count > 0`: soften wording, e.g. "shows" -> "suggests"
 
+## Per-cite vs per-attribution (E3)
+
+When a sentence has multiple citations (`claim X [a][b]`), the per-cite items
+list contains one row per cite. The canonical gate, however, is the
+**per-attribution** rollup: if any cite supports the attribution, the
+attribution is non-blocking (the talent just added an extra reference).
+
+- `blocking_count`: number of attributions whose rolled-up verdict is non-supportive (act on this)
+- `blocking_cite_count`: legacy per-cite count (for audit; usually higher)
+- `per_attribution`: rolled-up view with `sub_results` listing each cite
+
+This means a sentence with [supported, source_not_in_corpus] → blocking=0,
+blocking_cite=1. Talent can drop the unresolvable cite without rewriting the
+sentence.
+
 When no LLM client is available, the tool falls back to a conservative heuristic using source-text overlap and numeric consistency. This is less precise than an LLM judge but catches many number mismatches and misattributions.

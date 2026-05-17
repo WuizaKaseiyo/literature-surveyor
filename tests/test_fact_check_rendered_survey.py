@@ -279,6 +279,75 @@ def test_e2e_finding_claim_ids_match_factcheck_matched_claim_id(isolated_corpus,
     )
 
 
+# ---------------------------------------------------------------------------
+# E3 — multi-cite attribution aggregation (PR-?, post-A2)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_cite_supported_wins_over_missing(isolated_corpus, fake_paper):
+    """Sentence with two cites — A in corpus and supports, B not in corpus.
+    Per-cite items: 1 supported + 1 source_not_in_corpus. Per-attribution
+    rollup: supported (non-blocking). blocking_count should be 0."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345][Wang et al. 2024, arxiv:9999.99999]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    # Two per-cite items, but exactly one rolled-up attribution
+    assert res["total_checked"] == 2
+    assert res["total_attributions"] == 1
+    assert res["blocking_count"] == 0, "supported cite should non-block the attribution"
+    assert res["blocking_cite_count"] >= 1, "the missing cite still counts in legacy per-cite view"
+
+    per = res["per_attribution"][0]
+    assert per["final_verdict"] == "supported"
+    assert len(per["sub_results"]) == 2
+    verdicts = {s["verdict"] for s in per["sub_results"]}
+    assert "supported" in verdicts
+    assert "source_not_in_corpus" in verdicts
+
+
+def test_multi_cite_all_bad_stays_blocking(isolated_corpus):
+    """Sentence with two cites, both unresolved → attribution still blocking."""
+    md = (
+        "Some claim [Anonymous 2024, arxiv:1111.11111]"
+        "[Anonymous 2024, arxiv:2222.22222]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["total_attributions"] == 1
+    assert res["blocking_count"] == 1
+    per = res["per_attribution"][0]
+    assert per["final_verdict"] == "source_not_in_corpus"
+
+
+def test_single_cite_backward_compat(isolated_corpus, fake_paper):
+    """Single-cite case: total_attributions equals total_checked, behavior
+    identical to pre-E3."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["total_checked"] == res["total_attributions"] == 1
+    assert res["blocking_count"] == 0
+    assert res["blocking_count"] == res["blocking_cite_count"], (
+        "no multi-cite: attribution and per-cite blocking should agree"
+    )
+
+
 def test_use_extracted_claims_false_skips_anchor(isolated_corpus, fake_paper):
     """Explicitly disabling extracted claims keeps the BM25-only baseline path."""
     paper = dict(fake_paper)
