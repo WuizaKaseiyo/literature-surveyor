@@ -73,6 +73,23 @@ def test_finding_confidence_bounds():
         Finding(**bad_finding)
 
 
+def test_finding_claim_ids_default_empty():
+    f = Finding(
+        text="A bare finding without backing claim_ids.",
+        cites=[{"paper_id": "a", "cite_text": "..."}],
+    )
+    assert f.claim_ids == []
+
+
+def test_finding_claim_ids_accepts_list():
+    f = Finding(
+        text="A finding with two backing claims.",
+        cites=[{"paper_id": "2305.18290", "cite_text": "Rafailov et al. 2023"}],
+        claim_ids=["2305.18290#claim-3", "2305.18290#claim-7"],
+    )
+    assert f.claim_ids == ["2305.18290#claim-3", "2305.18290#claim-7"]
+
+
 def test_conflict_level_enum():
     valid = Conflict(
         id="c1",

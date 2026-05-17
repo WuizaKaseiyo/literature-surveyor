@@ -41,6 +41,12 @@ CONTEXT_CHARS = 80
 
 
 def _corpus_dir() -> Path:
+    # A2 layered mode: entity store (papers.jsonl) lives in the global dir.
+    g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
+    if g:
+        path = Path(g).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     p = os.getenv("LITSURVEY_CORPUS_DIR")
     if p:
         return Path(p).expanduser()

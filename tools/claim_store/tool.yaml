@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Per-corpus claim retrieval & BM25 search over claims.jsonl. 5 read-side
+  actions — search, list_by_paper, get, status, find_evidence.
+id: claim_store
+name: claim_store
+source_talent: literature-surveyor
+type: langchain_module

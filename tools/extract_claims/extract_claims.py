@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,10 @@ from pydantic import BaseModel, Field, ValidationError
 
 CLAIMS_FILENAME = "claims.jsonl"
 DEFAULT_EXTRACTION_MODEL = "openai/gpt-4o-mini"
-MAX_INPUT_CHARS = 30000  # truncate very long papers
+MAX_INPUT_CHARS = 30000  # truncate very long papers (v1 only)
+V2_MAX_SECTIONS = 8       # per-paper cap on sections sent to LLM
+V2_SECTION_CHAR_CAP = 8000
+V2_MIN_SECTION_CHARS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +51,13 @@ class Claim(BaseModel):
 
 
 def _corpus_dir() -> Path:
+    # A2 layered mode: papers.jsonl + claims.jsonl live in the global store,
+    # so claims written here are shared across projects automatically.
+    g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
+    if g:
+        path = Path(g).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     p = os.getenv("LITSURVEY_CORPUS_DIR")
     if p:
         return Path(p).expanduser()
@@ -135,6 +146,196 @@ def _call_llm_for_claims(paper_text: str, paper_meta: dict, model: str) -> list[
     return []
 
 
+# ---------------------------------------------------------------------------
+# v2 helpers — section split, quote round-trip verify, per-section LLM call
+# ---------------------------------------------------------------------------
+
+
+_HEAD_PAT = re.compile(r'^(#{1,6})\s+(.+?)\s*$')
+_SKIP_HEADING_PAT = re.compile(
+    r'\b(references|bibliography|acknowledg|appendix|supplementary|'
+    r'figure\s+\d|table\s+\d|author\s+contribution)\b',
+    re.IGNORECASE,
+)
+_CLAIM_KEYWORD_PAT = re.compile(
+    r'\b(method|methods|approach|model|models|architecture|algorithm|'
+    r'experiment|experiments|result|results|finding|findings|evaluation|'
+    r'ablation|ablations|analysis|discussion|conclusion|conclusions|'
+    r'limitation|limitations)\b',
+    re.IGNORECASE,
+)
+
+
+def _split_sections(text: str, max_level: int = 3) -> list[dict[str, Any]]:
+    """Split a markdown document into sections by ATX headings (#…###).
+
+    Returns [{heading, level, text}, …] in document order. Empty list if no
+    qualifying headings were found.
+    """
+    lines = text.splitlines()
+    sections: list[dict[str, Any]] = []
+    cur_heading = ""
+    cur_level = 0
+    cur_lines: list[str] = []
+
+    def flush() -> None:
+        if cur_heading and cur_lines:
+            body = "\n".join(cur_lines).strip()
+            if body:
+                sections.append({"heading": cur_heading, "level": cur_level, "text": body})
+
+    for line in lines:
+        m = _HEAD_PAT.match(line)
+        if m and len(m.group(1)) <= max_level:
+            flush()
+            cur_heading = m.group(2).strip()
+            cur_level = len(m.group(1))
+            cur_lines = []
+        else:
+            cur_lines.append(line)
+    flush()
+    return sections
+
+
+def _section_relevant(sec: dict[str, Any]) -> bool:
+    heading = sec.get("heading", "") or ""
+    if _SKIP_HEADING_PAT.search(heading):
+        return False
+    if len(sec.get("text", "")) < V2_MIN_SECTION_CHARS:
+        return False
+    return True
+
+
+def _rank_and_cap_sections(
+    sections: list[dict[str, Any]], max_sections: int = V2_MAX_SECTIONS
+) -> list[dict[str, Any]]:
+    """Keep at most `max_sections`, prioritizing claim-bearing headings."""
+    def score(sec: dict[str, Any]) -> int:
+        s = 0
+        if _CLAIM_KEYWORD_PAT.search(sec.get("heading", "") or ""):
+            s += 100
+        # Length contributes up to 50 points (caps at ~50K chars).
+        s += min(len(sec.get("text", "")) // 1000, 50)
+        return s
+
+    return sorted(sections, key=score, reverse=True)[:max_sections]
+
+
+def _normalize_for_match(text: str) -> str:
+    t = (text or "").lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s%.-]", "", t)
+    return t.strip()
+
+
+def _quote_in_source(quote: str, source: str) -> bool:
+    """True if a 60%-of-quote-length contiguous run of quote appears verbatim in source.
+
+    Same algorithm as `tests/eval/compare_extraction.quote_verified` — kept local
+    so this tool stays self-contained (OMC copies each tool dir to assets/).
+    """
+    if not quote or len(quote) < 10:
+        return False
+    nq = _normalize_for_match(quote)
+    nt = _normalize_for_match(source)
+    if not nq or not nt:
+        return False
+    if nq in nt:
+        return True
+    window = min(60, max(20, int(len(nq) * 0.6)))
+    if window > len(nq):
+        return False
+    step = max(1, window // 4)
+    for i in range(0, len(nq) - window + 1, step):
+        if nq[i : i + window] in nt:
+            return True
+    return False
+
+
+def _call_llm_for_claims_section(
+    section_text: str, section_heading: str, paper_meta: dict, model: str
+) -> list[dict]:
+    """Per-section LLM call. Aims for 0-4 claims, returns [] if section has none."""
+    system = (
+        "You extract structured claims from ONE section of an academic paper. "
+        "Return ONLY a JSON array of 0-4 claims. Each evidence_quote MUST be a "
+        "VERBATIM substring of the section text (no rewording, no paraphrase). "
+        "Return [] if the section has no concrete claims."
+    )
+    user = (
+        f"Paper: {paper_meta.get('title', '')}\n"
+        f"Section: {section_heading}\n\n"
+        f"Section text:\n---\n{section_text[:V2_SECTION_CHAR_CAP]}\n---\n\n"
+        "Each claim object MUST have these keys:\n"
+        '  claim_text (string, 1 sentence),\n'
+        '  claim_type (one of: factual / methodological / negative_result / conjecture),\n'
+        '  evidence_span (string, e.g. "Table 3" or "Eq. 4" — or the section heading if no specific anchor),\n'
+        '  evidence_quote (VERBATIM excerpt from the section text — must be findable by substring search),\n'
+        '  applies_to_dims (object — fill any of: model_size, dataset, domain, language, regime, metric — omit keys not stated in the section),\n'
+        '  confidence (float 0-1 — paper\'s own claimed confidence).\n\n'
+        "Return ONLY the JSON array, no commentary, no markdown fences."
+    )
+
+    raw = _invoke_llm(system, user, model)
+    if not raw:
+        return []
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "claims" in data:
+        return data.get("claims", []) or []
+    return []
+
+
+def _extract_v2(paper: dict, model: str) -> tuple[list[dict], list[str]]:
+    """Section-aware extraction. Returns (raw_claims_with_section_info, warnings)."""
+    full_text = paper.get("full_text_md") or ""
+    warnings: list[str] = []
+
+    if full_text:
+        sections = _split_sections(full_text, max_level=3)
+        if not sections:
+            warnings.append("no markdown headings detected — falling back to single-section mode")
+            sections = [{"heading": "(unstructured)", "level": 1, "text": full_text[:60000]}]
+    else:
+        abstract = paper.get("abstract") or ""
+        if len(abstract) < 200:
+            return [], ["paper has no full_text_md and abstract too short for v2"]
+        warnings.append("paper has no full_text_md — extracting from abstract only")
+        sections = [{"heading": "Abstract", "level": 1, "text": abstract}]
+
+    relevant = [s for s in sections if _section_relevant(s)]
+    if not relevant:
+        relevant = sections[:1]
+    selected = _rank_and_cap_sections(relevant, max_sections=V2_MAX_SECTIONS)
+
+    quote_source = full_text or paper.get("abstract", "")
+    all_raw: list[dict] = []
+    for sec in selected:
+        raw_claims = _call_llm_for_claims_section(sec["text"], sec["heading"], paper, model)
+        for c in raw_claims:
+            quote = c.get("evidence_quote", "")
+            verified = _quote_in_source(quote, quote_source)
+            c["evidence_quote_verified"] = verified
+            c["section_path"] = [sec["heading"]]
+            c["source_section"] = sec["heading"]
+            if not verified and quote:
+                warnings.append(
+                    f"unverified quote in '{sec['heading']}': {quote[:60]!r}"
+                )
+            all_raw.append(c)
+    return all_raw, warnings
+
+
 def _invoke_llm(system: str, user: str, model: str) -> str:
     """Try multiple LLM clients in order of preference."""
 
@@ -184,20 +385,53 @@ def _invoke_llm(system: str, user: str, model: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _load_existing_claims_for(paper_id: str) -> list[dict]:
+    """Return claims previously persisted for a paper, empty if none."""
+    path = _corpus_dir() / CLAIMS_FILENAME
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                c = json.loads(line)
+                if c.get("paper_id") == paper_id:
+                    out.append(c)
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
 @tool
 def extract_claims(
     paper_id: str,
     model: str = DEFAULT_EXTRACTION_MODEL,
+    version: str = "v1",
+    force: bool = False,
 ) -> dict[str, Any]:
     """Extract 5-15 structured claims from a paper in the corpus and persist them.
 
     Args:
         paper_id: ID of paper already added via corpus_add_paper.
         model: LLM model to use. Default openai/gpt-4o-mini (cheap structured extraction).
+        version: Extraction strategy version. "v1" (current) = single-shot on first
+            30K chars of full text. "v2" = section-aware split + per-section extraction
+            + evidence_quote ground-truth check + structured applies_to_dims.
+            See OPTIMIZATION.md section C for v2 design.
+        force: If False (default), short-circuit when claims for this paper_id
+            already exist (saves LLM calls + avoids duplicate rows). In A2
+            layered mode this is what enables cross-project claim reuse —
+            project B importing a paper that project A already extracted gets
+            the existing claims for free. Set True to re-extract anyway.
 
     Returns:
         {
           "paper_id": "...",
+          "version": "v1" | "v2",
+          "status": "extracted" | "reused" | "error",
           "claims_extracted": N,
           "claims": [{"id": "claim-...", "claim_text": "...", ...}, ...],
           "warnings": [...]
@@ -206,9 +440,94 @@ def extract_claims(
     if not paper_id:
         return {"error": "paper_id required"}
 
+    if version not in {"v1", "v2"}:
+        return {
+            "error": f"unknown extraction version {version!r}, expected 'v1' or 'v2'",
+            "paper_id": paper_id,
+        }
+
+    # A2 cross-project reuse short-circuit: if claims already exist for this
+    # paper, return them without burning an LLM call (the main reason layered
+    # corpus mode pays off).
+    if not force:
+        existing = _load_existing_claims_for(paper_id)
+        if existing:
+            return {
+                "paper_id": paper_id,
+                "version": existing[0].get("version", "unknown"),
+                "status": "reused",
+                "claims_extracted": len(existing),
+                "claims": existing,
+                "warnings": [
+                    f"reused {len(existing)} previously extracted claims; "
+                    "pass force=True to re-extract"
+                ],
+            }
+
     paper = _load_paper(paper_id)
     if not paper:
         return {"error": f"paper not found in corpus: {paper_id}"}
+
+    if version == "v2":
+        raw_claims, warnings = _extract_v2(paper, model)
+        if not raw_claims:
+            return {
+                "error": "v2 extraction returned no claims",
+                "paper_id": paper_id,
+                "version": "v2",
+                "claims_extracted": 0,
+                "claims": [],
+                "warnings": warnings,
+            }
+        validated: list[dict] = []
+        for i, raw in enumerate(raw_claims):
+            try:
+                dims = raw.get("applies_to_dims") or {}
+                # Backfill legacy free-form applies_to from structured dims.
+                applies_to_legacy = ", ".join(
+                    f"{k}={v}" for k, v in dims.items() if v
+                )
+                c = Claim(
+                    claim_text=raw.get("claim_text", ""),
+                    claim_type=raw.get("claim_type", "factual"),
+                    evidence_span=raw.get("evidence_span", ""),
+                    evidence_quote=raw.get("evidence_quote", ""),
+                    source_section=raw.get("source_section", ""),
+                    confidence=raw.get("confidence", 0.5),
+                    applies_to=applies_to_legacy,
+                )
+                validated.append(
+                    {
+                        "id": f"{paper_id}#claim-{i+1}",
+                        "paper_id": paper_id,
+                        "claim_text": c.claim_text,
+                        "claim_type": c.claim_type,
+                        "evidence_span": c.evidence_span,
+                        "evidence_quote": c.evidence_quote,
+                        "evidence_quote_verified": bool(raw.get("evidence_quote_verified", False)),
+                        "source_section": c.source_section,
+                        "section_path": raw.get("section_path", []),
+                        "confidence": c.confidence,
+                        "applies_to": c.applies_to,
+                        "applies_to_dims": dims,
+                        "extracted_at": time.time(),
+                        "model": model,
+                        "version": "v2",
+                    }
+                )
+            except ValidationError as e:
+                warnings.append(f"claim {i} invalid: {e.errors()[:1]}")
+
+        if validated:
+            _append_claims(validated)
+        return {
+            "paper_id": paper_id,
+            "version": "v2",
+            "status": "extracted",
+            "claims_extracted": len(validated),
+            "claims": validated,
+            "warnings": warnings,
+        }
 
     text = paper.get("full_text_md") or paper.get("abstract") or ""
     if len(text) < 200:
@@ -222,6 +541,7 @@ def extract_claims(
         return {
             "error": "LLM returned no parseable claims",
             "paper_id": paper_id,
+            "version": "v1",
             "claims_extracted": 0,
             "claims": [],
         }
@@ -244,6 +564,7 @@ def extract_claims(
                     "applies_to": c.applies_to,
                     "extracted_at": time.time(),
                     "model": model,
+                    "version": "v1",
                 }
             )
         except ValidationError as e:
@@ -254,6 +575,8 @@ def extract_claims(
 
     return {
         "paper_id": paper_id,
+        "version": "v1",
+        "status": "extracted",
         "claims_extracted": len(validated),
         "claims": validated,
         "warnings": warnings,

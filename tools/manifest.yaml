@@ -15,6 +15,12 @@ custom_tools:
   - corpus_list_papers
   - corpus_get_paper
   - extract_claims
+  - claim_search
+  - claim_list_by_paper
+  - claim_get
+  - claim_status
+  - claim_find_evidence
+  - detect_conflicts
   - verify_citations
   - fact_check_rendered_survey
   - self_assess

@@ -56,6 +56,13 @@ _STOP = frozenset(
 
 
 def _corpus_dir() -> Path:
+    # A2 layered mode: entity store (papers.jsonl, claims.jsonl) lives in the
+    # global dir so cross-project anchoring works automatically.
+    g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
+    if g:
+        path = Path(g).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     p = os.getenv("LITSURVEY_CORPUS_DIR")
     if p:
         return Path(p).expanduser()
@@ -79,6 +86,68 @@ def _load_papers() -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return papers
+
+
+def _load_claims_for_paper(paper_id: str) -> list[dict]:
+    """Read pre-extracted claims for one paper. Empty list if no claims.jsonl."""
+    if not paper_id:
+        return []
+    path = _corpus_dir() / "claims.jsonl"
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                c = json.loads(line)
+                if c.get("paper_id") == paper_id:
+                    out.append(c)
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _match_claim_to_sentence(
+    sentence: str, claims: list[dict]
+) -> tuple[dict | None, float]:
+    """Pick the claim most likely supporting `sentence`.
+
+    Token-overlap scoring (Jaccard against claim_text + evidence_quote) with a
+    minimum threshold to avoid spurious matches. Returns (best_claim, score) or
+    (None, 0.0).
+
+    Threshold rationale: require ≥ 3 shared content tokens AND Jaccard ≥ 0.12.
+    Below this, the BM25-on-full-text path is more reliable than a forced anchor.
+    """
+    if not claims:
+        return None, 0.0
+    sent_tokens = set(_tokenize(sentence))
+    if len(sent_tokens) < 2:
+        return None, 0.0
+
+    best: dict | None = None
+    best_score = 0.0
+    best_overlap = 0
+    for c in claims:
+        text = (c.get("claim_text") or "") + " " + (c.get("evidence_quote") or "")
+        c_tokens = set(_tokenize(text))
+        if not c_tokens:
+            continue
+        overlap = sent_tokens & c_tokens
+        if len(overlap) < 3:
+            continue
+        score = len(overlap) / max(len(sent_tokens | c_tokens), 1)
+        if score > best_score:
+            best_score = score
+            best_overlap = len(overlap)
+            best = c
+
+    if best is None or best_score < 0.12 or best_overlap < 3:
+        return None, best_score
+    return best, best_score
 
 
 def _paper_lookup(papers: list[dict]) -> dict[tuple[str, str], dict]:
@@ -340,6 +409,30 @@ def _heuristic_judge(claim: str, source: str) -> dict[str, Any]:
     }
 
 
+_CONFIDENCE_WORDS = {
+    "very high": 0.95, "high": 0.85, "medium-high": 0.75,
+    "medium": 0.6, "moderate": 0.6,
+    "medium-low": 0.45, "low": 0.3, "very low": 0.15,
+}
+
+
+def _parse_confidence(value: Any) -> float:
+    """Accept float, int, numeric string, or word ('high'/'medium'/'low'). Default 0.5."""
+    if value is None:
+        return 0.5
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _CONFIDENCE_WORDS:
+            return _CONFIDENCE_WORDS[s]
+        try:
+            return max(0.0, min(1.0, float(s.rstrip("%")) / (100.0 if "%" in s else 1.0)))
+        except ValueError:
+            return 0.5
+    return 0.5
+
+
 def _parse_llm_json(raw: str) -> dict | None:
     raw = (raw or "").strip()
     if not raw:
@@ -419,7 +512,7 @@ def _llm_judge(claim: str, context: str, model: str) -> dict[str, Any] | None:
         return None
     return {
         "verdict": verdict,
-        "confidence": float(data.get("confidence", 0.5) or 0.5),
+        "confidence": _parse_confidence(data.get("confidence")),
         "evidence_quote": str(data.get("evidence_quote", "") or "")[:1200],
         "explanation": str(data.get("explanation", "") or "")[:1200],
         "judge": f"llm:{model}",
@@ -431,6 +524,7 @@ def _check_claim_against_paper(
     paper: dict | None,
     judge_model: str,
     use_llm: bool,
+    use_extracted_claims: bool = True,
 ) -> dict[str, Any]:
     if paper is None:
         return {
@@ -439,20 +533,55 @@ def _check_claim_against_paper(
             "evidence_quote": "",
             "explanation": "The citation could not be resolved to a paper in the local corpus.",
             "judge": "resolver",
+            "matched_claim_id": "",
+            "matched_claim_quote": "",
         }
 
     source = _source_text(paper)
     context, top_sentences, _ = _select_context(claim, source)
 
-    if use_llm and context.strip():
-        judged = _llm_judge(claim, context, judge_model)
-        if judged:
-            return judged
+    matched_claim: dict | None = None
+    if use_extracted_claims:
+        claims = _load_claims_for_paper(paper.get("id", ""))
+        matched_claim, _match_score = _match_claim_to_sentence(claim, claims)
 
-    heuristic = _heuristic_judge(claim, source)
-    if not heuristic.get("evidence_quote") and top_sentences:
-        heuristic["evidence_quote"] = top_sentences[0]
-    return heuristic
+    if matched_claim and matched_claim.get("evidence_quote"):
+        # Use the pre-extracted claim as the primary anchor for the LLM judge.
+        # Old BM25 context is still appended for additional grounding.
+        anchor_lines = [
+            f"Extracted claim from paper: {matched_claim.get('claim_text', '')}",
+            f"Verbatim evidence quote: {matched_claim.get('evidence_quote', '')}",
+        ]
+        if matched_claim.get("source_section"):
+            anchor_lines.append(f"Section: {matched_claim.get('source_section', '')}")
+        anchor_block = "\n".join(anchor_lines)
+        judge_context = anchor_block + "\n\n---\n\nAdditional source context:\n" + context[:3000]
+    else:
+        judge_context = context
+
+    result: dict[str, Any]
+    if use_llm and judge_context.strip():
+        judged = _llm_judge(claim, judge_context, judge_model)
+        if judged:
+            result = judged
+        else:
+            result = _heuristic_judge(claim, source)
+    else:
+        result = _heuristic_judge(claim, source)
+
+    if not result.get("evidence_quote") and top_sentences:
+        result["evidence_quote"] = top_sentences[0]
+
+    if matched_claim:
+        result["matched_claim_id"] = matched_claim.get("id", "")
+        result["matched_claim_quote"] = matched_claim.get("evidence_quote", "")
+        # Prefer the matched claim's verbatim quote as the surface evidence.
+        if matched_claim.get("evidence_quote"):
+            result["evidence_quote"] = matched_claim["evidence_quote"]
+    else:
+        result.setdefault("matched_claim_id", "")
+        result.setdefault("matched_claim_quote", "")
+    return result
 
 
 def _summary(items: list[dict]) -> dict[str, Any]:
@@ -485,6 +614,7 @@ def fact_check_rendered_survey(
     use_llm: bool = False,
     judge_model: str = "openai/gpt-4o-mini",
     max_checks: int = 200,
+    use_extracted_claims: bool = True,
 ) -> dict[str, Any]:
     """Fact-check final Markdown claims against their cited corpus papers.
 
@@ -498,10 +628,14 @@ def fact_check_rendered_survey(
             otherwise use a conservative deterministic heuristic.
         judge_model: LLM judge model for use_llm=True.
         max_checks: Hard cap on attribution-citation pairs to evaluate.
+        use_extracted_claims: If True (default), when claims.jsonl is populated,
+            anchor the judge to the matched pre-extracted claim's evidence_quote
+            instead of (only) BM25-selecting context from raw paper text. Set
+            False to compare against the BM25-only baseline.
 
     Returns:
         {
-          "items": [...],
+          "items": [...],   # each item gains matched_claim_id, matched_claim_quote
           "supported_count": N,
           "unsupported_count": M,
           "blocking_count": K,
@@ -535,6 +669,7 @@ def fact_check_rendered_survey(
                 paper,
                 judge_model,
                 use_llm,
+                use_extracted_claims=use_extracted_claims,
             )
             items.append(
                 {
@@ -550,6 +685,8 @@ def fact_check_rendered_survey(
                     "evidence_quote": result.get("evidence_quote", ""),
                     "explanation": result.get("explanation", ""),
                     "judge": result.get("judge", "unknown"),
+                    "matched_claim_id": result.get("matched_claim_id", ""),
+                    "matched_claim_quote": result.get("matched_claim_quote", ""),
                 }
             )
         if len(items) >= max(1, min(int(max_checks), 1000)):

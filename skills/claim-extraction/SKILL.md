@@ -55,3 +55,19 @@ extract_claims(paper_id)  # 工具内部完成上述
 每个 claim 的 `applies_to` 字段是 conflict detection 的关键 —— 两篇 paper 在**同一 applies_to**下给出**矛盾的 claim_text** = conflict。
 
 如果你抽 claim 时不写 `applies_to`，conflict detection 会失效。
+
+## 与 Finding Rendering 的衔接
+
+每个 claim 的 `id` 后面会被 finding 的 `claim_ids` 引用 —— `claim_search()` 是
+talent 在写 finding 前必跑的查询。`evidence_quote` 会作为 evidence footnote 出现
+在最终 markdown 的 finding 下面，让人读 review 不用打开 PDF：
+
+```markdown
+DPO matches PPO on summarization [Rafailov et al. 2023, arxiv:2305.18290].
+
+> evidence: "matches or improves response quality in summarization and single-turn dialogue"
+> — Section 6, Table 1 (arxiv:2305.18290#claim-3)
+```
+
+所以 **`evidence_quote` 必须是原文 verbatim**（v2 抽取期已自动 substring 回校；
+v1 凭 LLM 复述，回校率约 95%）。复述失真的 quote 在 footnote 里就是噪声。

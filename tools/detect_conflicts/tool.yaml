@@ -1,0 +1,7 @@
+added_by: talent:literature-surveyor
+description: Cross-paper claim contradiction detector. Uses applies_to_dims as join
+  key, LLM as judge.
+id: detect_conflicts
+name: detect_conflicts
+source_talent: literature-surveyor
+type: langchain_module

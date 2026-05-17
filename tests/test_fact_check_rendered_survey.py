@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import json
+
 from tools.corpus_store.corpus_store import corpus_add_paper
 from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
     fact_check_rendered_survey,
     parse_attributions,
 )
+
+
+def _write_claims(corpus_dir, claims):
+    path = corpus_dir / "claims.jsonl"
+    with path.open("w") as f:
+        for c in claims:
+            f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
 
 def test_parse_backward_attribution():
@@ -22,6 +31,36 @@ def test_parse_backward_attribution():
     assert attrs[0]["claim_text"] == "The paper studies attention in small language models"
     assert attrs[1]["claim_text"].startswith("Pruning attention heads")
     assert all(a["citations"][0]["id"] == "2401.12345" for a in attrs)
+
+
+def test_parser_ignores_evidence_footnote():
+    """G段 evidence footnote format must not be parsed as a second attribution.
+
+    The convention from systematic-review/SKILL.md is:
+        Some finding [Author, arxiv:ID].
+
+        > evidence: "verbatim quote"
+        > — Section N (arxiv:ID#claim-K)
+
+    The blockquote uses parens around the claim ref, so it should:
+      (a) not match the [author, arxiv:id] cite regex
+      (b) be dropped because no cite anchors the paragraph
+    """
+    md = (
+        "DPO matches PPO on summarization "
+        "[Rafailov et al. 2023, arxiv:2305.18290].\n"
+        "\n"
+        "> evidence: \"matches or improves response quality in summarization\"\n"
+        "> — Section 6, Table 1 (arxiv:2305.18290#claim-3)\n"
+    )
+    attrs = parse_attributions(md)
+    # exactly 1 attribution: the finding sentence
+    assert len(attrs) == 1
+    assert attrs[0]["citations"][0]["id"] == "2305.18290"
+    # the #claim-3 ref inside parens must NOT be parsed as a cite
+    for a in attrs:
+        for c in a["citations"]:
+            assert "claim" not in c["id"]
 
 
 def test_parser_ignores_code_blocks():
@@ -80,4 +119,198 @@ def test_fact_check_requires_cited_paper_in_corpus(isolated_corpus):
 
     assert res["source_not_in_corpus_count"] == 1
     assert res["blocking_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# E1 — claim-anchored path (PR-3)
+# ---------------------------------------------------------------------------
+
+
+def test_anchors_to_matched_claim_when_available(isolated_corpus, fake_paper):
+    """When claims.jsonl has a strong match, the result records matched_claim_id
+    and surfaces the claim's verbatim evidence_quote (not a BM25 top sentence)."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Section 4.2 establishes that pruning attention heads in small models "
+        "leads to noticeable speedups. Specific numbers in Table 3."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    _write_claims(isolated_corpus, [
+        {
+            "id": "2401.12345#claim-1",
+            "paper_id": "2401.12345",
+            "claim_text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "claim_type": "factual",
+            "evidence_span": "Section 4.2, Table 3",
+            "evidence_quote": "Pruning attention heads leads to 30% latency reduction in 1B-7B models.",
+            "source_section": "Section 4.2",
+            "confidence": 0.85,
+            "applies_to": "models 1B-7B",
+        },
+    ])
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in language models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    assert res["total_checked"] == 1
+    item = res["items"][0]
+    assert item["matched_claim_id"] == "2401.12345#claim-1"
+    assert "30% latency reduction" in item["matched_claim_quote"]
+    # The surface evidence_quote is the matched claim's verbatim quote.
+    assert item["evidence_quote"] == item["matched_claim_quote"]
+
+
+def test_falls_back_to_bm25_when_no_claim_matches(isolated_corpus, fake_paper):
+    """Claims exist but none overlap the sentence — anchor is skipped, BM25 path
+    runs, matched_claim_id stays empty."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    _write_claims(isolated_corpus, [
+        {
+            "id": "2401.12345#claim-1",
+            "paper_id": "2401.12345",
+            "claim_text": "Carbon emissions during pretraining were offset by Meta sustainability programs.",
+            "claim_type": "factual",
+            "evidence_span": "Section 2.2.1",
+            "evidence_quote": "Total emissions were fully offset.",
+            "source_section": "Section 2.2.1",
+            "confidence": 0.7,
+            "applies_to": "Llama 2 pretraining",
+        },
+    ])
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    item = res["items"][0]
+    assert item["matched_claim_id"] == ""
+    assert item["matched_claim_quote"] == ""
+    # Still passes via BM25 + heuristic since abstract supports the claim.
+    assert res["supported_count"] == 1
+
+
+def test_no_claims_file_no_regression(isolated_corpus, fake_paper):
+    """claims.jsonl absent: old behavior preserved, matched_* fields are empty."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    item = res["items"][0]
+    assert item["matched_claim_id"] == ""
+    assert item["matched_claim_quote"] == ""
+    assert res["supported_count"] == 1
+
+
+def test_e2e_finding_claim_ids_match_factcheck_matched_claim_id(isolated_corpus, fake_paper):
+    """G段 闭环：Finding 声明的 claim_ids 应该和 fact_check 实际找到的 matched_claim_id 一致。
+
+    这是 step 9 的交叉校验流程的 happy path 测试 —— 验证 SKILL.md 里 step 7.5
+    (写 finding 前 claim_search) 和 step 9 (fact_check 后核对 matched_claim_id)
+    数据闭环。
+    """
+    # 1. corpus 里放一篇 paper + 一条 backing claim
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "DPO matches or improves response quality vs PPO-based RLHF on "
+        "summarization and single-turn dialogue tasks."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    backing_claim = {
+        "id": "2401.12345#claim-3",
+        "paper_id": "2401.12345",
+        "claim_text": "DPO matches or improves response quality vs PPO-based RLHF on summarization.",
+        "claim_type": "factual",
+        "evidence_span": "Section 6, Table 1",
+        "evidence_quote": (
+            "matches or improves response quality in summarization "
+            "and single-turn dialogue with significantly less compute"
+        ),
+        "source_section": "Section 6",
+        "confidence": 0.85,
+        "applies_to": "GPT-2 large, summarization",
+    }
+    _write_claims(isolated_corpus, [backing_claim])
+
+    # 2. talent 在 stage2.json 里写的 Finding（含 claim_ids）
+    from schemas.literature_survey_schema import CitationRef, Finding
+    finding = Finding(
+        text="DPO matches PPO-based RLHF on summarization quality.",
+        cites=[CitationRef(paper_id="2401.12345", cite_text="Smith et al. 2024, arxiv:2401.12345")],
+        claim_ids=["2401.12345#claim-3"],
+    )
+    assert finding.claim_ids == ["2401.12345#claim-3"]
+
+    # 3. talent 按 G2 约定渲染 markdown（finding + evidence footnote）
+    rendered = (
+        f"{finding.text[:-1]} [Smith et al. 2024, arxiv:2401.12345].\n\n"
+        f"> evidence: \"{backing_claim['evidence_quote']}\"\n"
+        f"> — {backing_claim['source_section']} (arxiv:{backing_claim['paper_id']}#claim-3)\n"
+    )
+
+    # 4. fact_check 跑
+    res = fact_check_rendered_survey.invoke({"markdown": rendered, "use_llm": False})
+
+    # 5. 只 parse 出 1 个 attribution（footnote 没被算第二条）
+    assert res["total_checked"] == 1, res["items"]
+
+    # 6. matched_claim_id 真的命中了 Finding 声明的那条
+    item = res["items"][0]
+    assert item["matched_claim_id"] == "2401.12345#claim-3"
+    assert item["matched_claim_id"] in finding.claim_ids, (
+        f"cross-check failed: fact_check matched {item['matched_claim_id']} "
+        f"but Finding.claim_ids = {finding.claim_ids}"
+    )
+
+
+def test_use_extracted_claims_false_skips_anchor(isolated_corpus, fake_paper):
+    """Explicitly disabling extracted claims keeps the BM25-only baseline path."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    _write_claims(isolated_corpus, [
+        {
+            "id": "2401.12345#claim-1",
+            "paper_id": "2401.12345",
+            "claim_text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "claim_type": "factual",
+            "evidence_span": "Section 4.2",
+            "evidence_quote": "30% latency reduction in pruned attention heads.",
+            "source_section": "Section 4.2",
+            "confidence": 0.85,
+            "applies_to": "1B-7B",
+        },
+    ])
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({
+        "markdown": md,
+        "use_llm": False,
+        "use_extracted_claims": False,
+    })
+
+    item = res["items"][0]
+    assert item["matched_claim_id"] == ""
+    assert item["matched_claim_quote"] == ""
 
