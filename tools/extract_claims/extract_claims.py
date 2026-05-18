@@ -98,9 +98,118 @@ def _append_claims(claims: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _call_llm_for_claims(paper_text: str, paper_meta: dict, model: str) -> list[dict]:
-    """Returns list of dicts (raw, pre-validation). Empty list on hard failure."""
+def _call_llm_with_retry(system: str, user: str, model: str, max_retries: int = 1) -> str:
+    """Wrap _invoke_llm with a single retry on empty response.
 
+    Only retries when the first call returned "" — that's the transient case
+    (API blip, rate limit, momentary auth issue). Does not retry on malformed
+    JSON — that's handled by _parse_claims_response. Backoff 0.3s between
+    attempts, capped at max_retries (default 1).
+    """
+    raw = _invoke_llm(system, user, model)
+    if raw:
+        return raw
+    for attempt in range(max_retries):
+        time.sleep(0.3 * (attempt + 1))
+        raw = _invoke_llm(system, user, model)
+        if raw:
+            return raw
+    return ""
+
+
+def _salvage_json_objects(raw: str) -> list[dict]:
+    """Extract balanced {…} blocks from a string. String-aware: braces inside
+    JSON strings (and their escape sequences) do not count toward depth.
+
+    Used by _parse_claims_response as the partial-parse fallback when the
+    LLM wraps its output with prose or truncates the last object.
+    """
+    out: list[dict] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escape = False
+    for i, c in enumerate(raw):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+            continue
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(raw[start : i + 1])
+                        if isinstance(obj, dict):
+                            out.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    start = -1
+    return out
+
+
+def _parse_claims_response(raw: str) -> tuple[list[dict], str]:
+    """Best-effort parse of an LLM JSON response into a list of claim dicts.
+
+    Pipeline (cheap → tolerant):
+      1. Strip ```json``` fences.
+      2. Strict json.loads → list, or {"claims": [...]}, or single claim dict.
+      3. Salvage: extract balanced {…} blocks and parse each independently.
+         Survives prose prefixes ("Here are the claims: [...]") and a
+         truncated last object (max_tokens cutoff mid-array).
+
+    Returns:
+        (claims, parse_mode) — mode is one of
+        empty / strict_array / strict_claims_key / strict_dict / salvaged_N / failed.
+        Callers should surface salvaged_N / failed to talent-visible warnings.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return [], "empty"
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict)], "strict_array"
+        if isinstance(data, dict):
+            if isinstance(data.get("claims"), list):
+                return [d for d in data["claims"] if isinstance(d, dict)], "strict_claims_key"
+            if "claim_text" in data:
+                return [data], "strict_dict"
+    except json.JSONDecodeError:
+        pass
+
+    salvaged = _salvage_json_objects(raw)
+    if salvaged:
+        return salvaged, f"salvaged_{len(salvaged)}"
+    return [], "failed"
+
+
+def _call_llm_for_claims(
+    paper_text: str, paper_meta: dict, model: str
+) -> tuple[list[dict], str]:
+    """v1 single-shot claim extraction.
+
+    Returns (claims, parse_mode). parse_mode is forwarded to talent warnings
+    when it's salvaged_* or failed so the caller knows the response needed
+    rescue (or was unrescuable).
+    """
     system = (
         "You are a precise academic claim extractor. Given a paper, return ONLY a JSON "
         "array of 5-15 claims. Each claim is a factual statement made by the paper "
@@ -123,27 +232,8 @@ def _call_llm_for_claims(paper_text: str, paper_meta: dict, model: str) -> list[
         "Return ONLY the JSON array, nothing else."
     )
 
-    raw = _invoke_llm(system, user, model)
-    if not raw:
-        return []
-
-    # Strip ```json fences if model added them
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "claims" in data:
-            return data["claims"]
-    except json.JSONDecodeError:
-        pass
-    return []
+    raw = _call_llm_with_retry(system, user, model)
+    return _parse_claims_response(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +344,10 @@ def _quote_in_source(quote: str, source: str) -> bool:
 
 def _call_llm_for_claims_section(
     section_text: str, section_heading: str, paper_meta: dict, model: str
-) -> list[dict]:
-    """Per-section LLM call. Aims for 0-4 claims, returns [] if section has none."""
+) -> tuple[list[dict], str]:
+    """Per-section LLM call. Aims for 0-4 claims, returns ([], mode) if the
+    section has none. Same shape as _call_llm_for_claims so per-section
+    parse_mode bubbles up to talent warnings."""
     system = (
         "You extract structured claims from ONE section of an academic paper. "
         "Return ONLY a JSON array of 0-4 claims. Each evidence_quote MUST be a "
@@ -276,24 +368,8 @@ def _call_llm_for_claims_section(
         "Return ONLY the JSON array, no commentary, no markdown fences."
     )
 
-    raw = _invoke_llm(system, user, model)
-    if not raw:
-        return []
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "claims" in data:
-        return data.get("claims", []) or []
-    return []
+    raw = _call_llm_with_retry(system, user, model)
+    return _parse_claims_response(raw)
 
 
 def _extract_v2(paper: dict, model: str) -> tuple[list[dict], list[str]]:
@@ -321,7 +397,22 @@ def _extract_v2(paper: dict, model: str) -> tuple[list[dict], list[str]]:
     quote_source = full_text or paper.get("abstract", "")
     all_raw: list[dict] = []
     for sec in selected:
-        raw_claims = _call_llm_for_claims_section(sec["text"], sec["heading"], paper, model)
+        raw_claims, parse_mode = _call_llm_for_claims_section(
+            sec["text"], sec["heading"], paper, model
+        )
+        if parse_mode.startswith("salvaged_"):
+            warnings.append(
+                f"section '{sec['heading']}': LLM response malformed, "
+                f"rescued via partial parse ({parse_mode})"
+            )
+        elif parse_mode == "failed":
+            warnings.append(
+                f"section '{sec['heading']}': LLM response unparseable, 0 claims this section"
+            )
+        elif parse_mode == "empty":
+            warnings.append(
+                f"section '{sec['heading']}': empty LLM response after retry"
+            )
         for c in raw_claims:
             quote = c.get("evidence_quote", "")
             verified = _quote_in_source(quote, quote_source)
@@ -536,10 +627,10 @@ def extract_claims(
             "paper_id": paper_id,
         }
 
-    raw_claims = _call_llm_for_claims(text, paper, model)
+    raw_claims, v1_parse_mode = _call_llm_for_claims(text, paper, model)
     if not raw_claims:
         return {
-            "error": "LLM returned no parseable claims",
+            "error": f"LLM returned no parseable claims ({v1_parse_mode})",
             "paper_id": paper_id,
             "version": "v1",
             "claims_extracted": 0,
@@ -548,6 +639,10 @@ def extract_claims(
 
     validated: list[dict] = []
     warnings: list[str] = []
+    if v1_parse_mode.startswith("salvaged_"):
+        warnings.append(
+            f"v1 LLM response malformed; rescued via partial parse ({v1_parse_mode})"
+        )
     for i, raw in enumerate(raw_claims):
         try:
             c = Claim(**raw)

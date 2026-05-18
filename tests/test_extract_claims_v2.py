@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from unittest.mock import patch
+
 from tools.extract_claims.extract_claims import (
+    _call_llm_with_retry,
+    _parse_claims_response,
     _quote_in_source,
     _rank_and_cap_sections,
+    _salvage_json_objects,
     _section_relevant,
     _split_sections,
 )
@@ -125,3 +131,143 @@ def test_quote_verified_rejects_fabricated():
 def test_quote_verified_rejects_too_short():
     src = "Anything."
     assert _quote_in_source("short", src) is False
+
+
+# ---------------------------------------------------------------------------
+# C6 — robust parsing + retry
+# ---------------------------------------------------------------------------
+
+
+def test_parse_strict_array():
+    raw = json.dumps([{"claim_text": "a"}, {"claim_text": "b"}])
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "strict_array"
+    assert len(claims) == 2
+
+
+def test_parse_strict_claims_key():
+    raw = json.dumps({"claims": [{"claim_text": "a"}]})
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "strict_claims_key"
+    assert len(claims) == 1
+
+
+def test_parse_strict_single_dict():
+    raw = json.dumps({"claim_text": "lonely"})
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "strict_dict"
+    assert claims == [{"claim_text": "lonely"}]
+
+
+def test_parse_strips_json_fence():
+    raw = '```json\n[{"claim_text": "fenced"}]\n```'
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "strict_array"
+    assert claims[0]["claim_text"] == "fenced"
+
+
+def test_parse_empty_returns_empty_mode():
+    claims, mode = _parse_claims_response("")
+    assert claims == []
+    assert mode == "empty"
+
+    claims, mode = _parse_claims_response("   \n\n  ")
+    assert claims == []
+    assert mode == "empty"
+
+
+def test_parse_salvage_prose_prefix():
+    """LLM wrote prose before the array — strict fails, salvage picks objects."""
+    raw = (
+        "Here are the claims I extracted from the paper:\n\n"
+        '{"claim_text": "first claim"}\n'
+        '{"claim_text": "second claim"}\n'
+        "Hope these are useful!"
+    )
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "salvaged_2"
+    assert {c["claim_text"] for c in claims} == {"first claim", "second claim"}
+
+
+def test_parse_salvage_truncated_last_object():
+    """LLM hit max_tokens mid-array — partial parse keeps the complete ones."""
+    raw = (
+        '[{"claim_text": "complete one"}, '
+        '{"claim_text": "another complete"}, '
+        '{"claim_text": "incomp'   # truncated, unbalanced quote and brace
+    )
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "salvaged_2"
+    assert {c["claim_text"] for c in claims} == {"complete one", "another complete"}
+
+
+def test_parse_salvage_handles_brace_in_string():
+    """Brace inside a JSON string must not split the object boundary."""
+    raw = (
+        "preamble: "
+        '{"claim_text": "has {brace} in text"} '
+        '{"claim_text": "next"}'
+    )
+    claims, mode = _parse_claims_response(raw)
+    assert mode == "salvaged_2"
+    assert claims[0]["claim_text"] == "has {brace} in text"
+
+
+def test_parse_failed_returns_failed_mode():
+    claims, mode = _parse_claims_response("no JSON at all, just words")
+    assert claims == []
+    assert mode == "failed"
+
+
+def test_salvage_skips_non_dict():
+    """Salvage finds {} blocks but should only return dicts."""
+    raw = '[1, 2, 3] {"claim_text": "real"} [4, 5]'
+    found = _salvage_json_objects(raw)
+    assert found == [{"claim_text": "real"}]
+
+
+def test_retry_invokes_twice_on_empty_response():
+    """First call returns "" → retry once → success."""
+    calls = []
+
+    def fake(system, user, model):
+        calls.append((system, user, model))
+        return "" if len(calls) == 1 else "ok-second"
+
+    with patch("tools.extract_claims.extract_claims._invoke_llm", side_effect=fake), \
+         patch("tools.extract_claims.extract_claims.time.sleep"):
+        result = _call_llm_with_retry("sys", "usr", "model-x")
+
+    assert len(calls) == 2
+    assert result == "ok-second"
+
+
+def test_retry_skipped_when_first_call_succeeds():
+    calls = []
+
+    def fake(system, user, model):
+        calls.append(1)
+        return "first-ok"
+
+    with patch("tools.extract_claims.extract_claims._invoke_llm", side_effect=fake), \
+         patch("tools.extract_claims.extract_claims.time.sleep"):
+        result = _call_llm_with_retry("s", "u", "m")
+
+    assert len(calls) == 1
+    assert result == "first-ok"
+
+
+def test_retry_gives_up_after_max():
+    """If retries also return "", final result is also "" — no infinite loop."""
+    calls = []
+
+    def fake(system, user, model):
+        calls.append(1)
+        return ""
+
+    with patch("tools.extract_claims.extract_claims._invoke_llm", side_effect=fake), \
+         patch("tools.extract_claims.extract_claims.time.sleep"):
+        result = _call_llm_with_retry("s", "u", "m", max_retries=2)
+
+    assert result == ""
+    assert len(calls) == 3  # 1 initial + 2 retries

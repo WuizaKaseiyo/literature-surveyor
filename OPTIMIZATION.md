@@ -110,13 +110,17 @@
 - [ ] 保留 free-form `applies_to` string 做向后兼容（自动拼出）
 - [ ] 这是 conflict detection 的 join key，**强约束非空**
 
-### C5. `claim_type` 严格化
-- [ ] `Literal["factual","methodological","negative_result","conjecture"]`
-- [ ] ValidationError 进 warnings 不写入
+### C5. `claim_type` 严格化 —— 🛑 故意不做（audit 后决定）
+- 实测 DS-V3 在 248 个 real claim 上 **100% 守 canonical** 4 个值，0 变体
+- 加 Literal 是纯防御；对**今天**的 LLM 行为 0 改善
+- 未来真观察到模型乱来再加，避免为理论 bug 加代码
 
-### C6. Retry / partial parse
-- [ ] LLM 非合法 JSON 时，regex 切大括号块逐个尝试，可解析的全收
-- [ ] LLM 失败重试一次（不同 temperature 或 fallback model）
+### C6. Retry / partial parse —— ✅ 完成
+- [x] 共享 `_parse_claims_response(raw)` helper：strict array → strict claims-key → strict single dict → salvage `{…}` blocks（string-aware）
+- [x] `_salvage_json_objects(raw)` 处理 prose 前缀 / max_tokens 截断 / 字符串内含 `{}`
+- [x] `_call_llm_with_retry`：仅空响应触发，max 1 retry，0.3s backoff（不无限重试）
+- [x] v1 + v2 调用点改造，parse_mode (`strict_array` / `salvaged_N` / `failed` / `empty`) 透出到 warnings
+- [x] 13 个新 LLM-free 测试覆盖所有 parse 路径 + retry 行为（mock sleep 避免拖慢）
 
 ### C7. 写入 global
 - [ ] `claims.jsonl` 写 global 而不是 project
