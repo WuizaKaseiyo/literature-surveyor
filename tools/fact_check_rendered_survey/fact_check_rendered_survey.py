@@ -668,8 +668,10 @@ def _llm_judge(claim: str, context: str, model: str) -> dict[str, Any] | None:
     return {
         "verdict": verdict,
         "confidence": _parse_confidence(data.get("confidence")),
-        "evidence_quote": str(data.get("evidence_quote", ""))[:1200],
-        "explanation": str(data.get("explanation", ""))[:1200],
+        # `or ""` guards against LLM returning `"evidence_quote": null` — str(None)
+        # would otherwise stamp the literal "None" into the field.
+        "evidence_quote": str(data.get("evidence_quote") or "")[:1200],
+        "explanation": str(data.get("explanation") or "")[:1200],
         "judge": f"llm:{model}",
     }
 
