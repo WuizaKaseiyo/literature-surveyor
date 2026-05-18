@@ -91,6 +91,44 @@ def _append_claims(claims: list[dict]) -> None:
             f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
 
+def _replace_claims_for(paper_id: str, new_claims: list[dict]) -> int:
+    """Atomically swap a paper's claims for `new_claims`.
+
+    Used on force=True re-extraction: a plain append leaves the prior rows
+    behind, producing duplicate `#claim-N` ids and stale text downstream.
+    Rewrites claims.jsonl via tmp + rename so readers never see a torn file.
+    Returns the number of prior rows replaced.
+    """
+    cd = _corpus_dir()
+    cd.mkdir(parents=True, exist_ok=True)
+    path = cd / CLAIMS_FILENAME
+    kept: list[dict] = []
+    removed = 0
+    if path.exists():
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if c.get("paper_id") == paper_id:
+                    removed += 1
+                else:
+                    kept.append(c)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        for c in kept:
+            f.write(json.dumps(c, ensure_ascii=False) + "\n")
+        for c in new_claims:
+            f.write(json.dumps(c, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # LLM call — uses OMC make_llm if importable, else openai/openrouter direct
 # ---------------------------------------------------------------------------
@@ -607,7 +645,10 @@ def extract_claims(
                 warnings.append(f"claim {i} invalid: {e.errors()[:1]}")
 
         if validated:
-            _append_claims(validated)
+            if force:
+                _replace_claims_for(paper_id, validated)
+            else:
+                _append_claims(validated)
         return {
             "paper_id": paper_id,
             "version": "v2",
@@ -667,7 +708,10 @@ def extract_claims(
             warnings.append(f"claim {i} invalid: {e.errors()[:1]}")
 
     if validated:
-        _append_claims(validated)
+        if force:
+            _replace_claims_for(paper_id, validated)
+        else:
+            _append_claims(validated)
 
     return {
         "paper_id": paper_id,

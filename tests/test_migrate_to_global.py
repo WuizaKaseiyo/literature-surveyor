@@ -158,3 +158,96 @@ def test_migrated_corpus_works_in_layered_mode(tmp_path, monkeypatch):
     listed = corpus_list_papers.invoke({"scope": "project"})
     ids = {p["id"] for p in listed["papers"]}
     assert ids == {"2401.10001", "2401.10002"}
+
+
+def test_migration_rebuilds_corpus_index_for_search(tmp_path, monkeypatch):
+    """corpus_search must find migrated papers without an extra reindex step.
+
+    Regression: migrate() used to write papers.jsonl into the global pool but
+    never built corpus_index.json. Subsequent corpus_search returned 0 results
+    because _load_index() defaulted to an empty index when the file was absent.
+    """
+    from tools.corpus_store.corpus_store import corpus_search
+
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    global_dir = tmp_path / "global"
+
+    papers = [
+        {
+            "id": "arxiv:1111.1111",
+            "title": "Transformer attention patterns",
+            "abstract": "self-attention",
+            "full_text_md": "transformer architecture",
+            "source": "arxiv",
+            "added_at": 1.0,
+            "source_query": "transformer",
+        },
+        {
+            "id": "arxiv:2222.2222",
+            "title": "BERT pretraining",
+            "abstract": "masked language model",
+            "full_text_md": "bidirectional encoder",
+            "source": "arxiv",
+            "added_at": 2.0,
+            "source_query": "bert",
+        },
+    ]
+    with (legacy_dir / "papers.jsonl").open("w") as f:
+        for p in papers:
+            f.write(json.dumps(p) + "\n")
+
+    migrate(source=legacy_dir, global_dir=global_dir)
+
+    index_path = global_dir / "corpus_index.json"
+    assert index_path.exists(), "migration must build the global BM25 index"
+    idx = json.loads(index_path.read_text())
+    assert set(idx.get("doc_tokens", {}).keys()) == {"arxiv:1111.1111", "arxiv:2222.2222"}
+
+    monkeypatch.setenv("LITSURVEY_CORPUS_DIR", str(legacy_dir))
+    monkeypatch.setenv("LITSURVEY_GLOBAL_CORPUS_DIR", str(global_dir))
+
+    res = corpus_search.invoke({"query": "transformer attention", "top_k": 5})
+    found_ids = {r["paper"]["id"] for r in res.get("results", [])}
+    assert "arxiv:1111.1111" in found_ids, (
+        f"migrated paper invisible to corpus_search; got {found_ids}"
+    )
+
+
+def test_migration_index_rebuild_preserves_existing_global_papers(tmp_path):
+    """If the global pool already has papers (from a prior project's adds),
+    a fresh migration must include both old and new papers in the rebuilt index."""
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+
+    # Pre-seed the global pool with one paper (no index — simulating a fresh
+    # global dir or a corpus_add_paper that ran before any search).
+    pre_existing = {
+        "id": "arxiv:0000.0000",
+        "title": "Pre-existing global paper",
+        "abstract": "alpha beta gamma",
+        "full_text_md": "preexisting content",
+        "source": "arxiv",
+        "added_at": 0.5,
+    }
+    with (global_dir / "papers.jsonl").open("w") as f:
+        f.write(json.dumps(pre_existing) + "\n")
+
+    new_paper = {
+        "id": "arxiv:3333.3333",
+        "title": "Migrated paper",
+        "abstract": "delta epsilon",
+        "full_text_md": "migrated content",
+        "source": "arxiv",
+        "added_at": 1.0,
+        "source_query": "migrated",
+    }
+    with (legacy_dir / "papers.jsonl").open("w") as f:
+        f.write(json.dumps(new_paper) + "\n")
+
+    migrate(source=legacy_dir, global_dir=global_dir)
+
+    idx = json.loads((global_dir / "corpus_index.json").read_text())
+    assert set(idx["doc_tokens"].keys()) == {"arxiv:0000.0000", "arxiv:3333.3333"}

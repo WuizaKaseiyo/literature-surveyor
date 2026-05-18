@@ -67,6 +67,35 @@ def _existing_ids(jsonl_path: Path, key: str = "id") -> set[str]:
     return {r.get(key) for r in _read_jsonl(jsonl_path) if r.get(key)}
 
 
+def _rebuild_global_index(global_dir: Path) -> int:
+    """Rebuild `global_dir/corpus_index.json` from `global_dir/papers.jsonl`.
+
+    Migration used to skip this step, leaving the index file absent. corpus_search
+    then defaulted to an empty index and returned 0 results for any query —
+    promoted papers were search-invisible until each was re-added one by one.
+
+    Full rebuild (not incremental) so any drift in the existing index from prior
+    in-place activity is corrected at the same time. Atomic tmp+rename matches
+    `corpus_store._save_index` so a concurrent reader can't observe a torn file.
+    """
+    # Lazy import — corpus_store imports langchain at module load; keep migration
+    # script cheap to invoke if neither side is changed.
+    from tools.corpus_store.corpus_store import _update_index_for
+
+    papers_path = global_dir / "papers.jsonl"
+    papers = _read_jsonl(papers_path)
+    idx: dict = {"doc_freq": {}, "doc_count": 0, "doc_tokens": {}}
+    for p in papers:
+        if p.get("id"):
+            _update_index_for(p, idx)
+
+    index_path = global_dir / "corpus_index.json"
+    tmp = index_path.with_suffix(index_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(idx, ensure_ascii=False))
+    tmp.replace(index_path)
+    return len(papers)
+
+
 def migrate(
     source: Path,
     global_dir: Path,
@@ -139,6 +168,10 @@ def migrate(
             with dst_claims.open("a") as f:
                 for c in claims_to_promote:
                     f.write(json.dumps(c, ensure_ascii=False) + "\n")
+        # Always rebuild the global BM25 index — promoted papers must be
+        # immediately visible to corpus_search. Also corrects any prior drift.
+        indexed = _rebuild_global_index(global_dir)
+        summary["indexed_in_global"] = indexed
 
     # Project refs: append + dedup by (paper_id, source_query). Previously we
     # truncated, which broke idempotency — re-running migration after some

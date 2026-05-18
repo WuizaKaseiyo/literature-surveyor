@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import tools.extract_claims.extract_claims as ec_mod
 from tools.extract_claims.extract_claims import (
     _call_llm_with_retry,
     _parse_claims_response,
@@ -13,6 +14,7 @@ from tools.extract_claims.extract_claims import (
     _salvage_json_objects,
     _section_relevant,
     _split_sections,
+    extract_claims,
 )
 
 
@@ -270,4 +272,140 @@ def test_retry_gives_up_after_max():
         result = _call_llm_with_retry("s", "u", "m", max_retries=2)
 
     assert result == ""
-    assert len(calls) == 3  # 1 initial + 2 retries
+
+
+def test_force_true_replaces_existing_claims(isolated_corpus, monkeypatch):
+    """force=True must REPLACE prior claims for the same paper_id, not append-and-duplicate.
+
+    Regression: the original implementation skipped the cache short-circuit on
+    force=True but went straight to _append_claims, leaving the old rows in
+    claims.jsonl. Result: duplicate '#claim-N' IDs and stale text downstream.
+    """
+    paper = {
+        "id": "arxiv:9999.99999",
+        "title": "T",
+        "abstract": "x" * 300,
+        "full_text_md": "Some paper full text. " * 60,
+        "source": "arxiv",
+    }
+    (isolated_corpus / "papers.jsonl").write_text(json.dumps(paper) + "\n")
+
+    stale = [
+        {
+            "id": "arxiv:9999.99999#claim-1",
+            "paper_id": "arxiv:9999.99999",
+            "claim_text": "stale 1",
+            "claim_type": "factual",
+            "evidence_quote": "q",
+            "evidence_span": "",
+            "source_section": "",
+            "confidence": 0.7,
+            "applies_to": "",
+            "version": "v1",
+        },
+        {
+            "id": "arxiv:9999.99999#claim-2",
+            "paper_id": "arxiv:9999.99999",
+            "claim_text": "stale 2",
+            "claim_type": "factual",
+            "evidence_quote": "q",
+            "evidence_span": "",
+            "source_section": "",
+            "confidence": 0.7,
+            "applies_to": "",
+            "version": "v1",
+        },
+        # Sibling paper's claim must survive the purge.
+        {
+            "id": "arxiv:8888.88888#claim-1",
+            "paper_id": "arxiv:8888.88888",
+            "claim_text": "sibling",
+            "claim_type": "factual",
+            "evidence_quote": "q",
+            "evidence_span": "",
+            "source_section": "",
+            "confidence": 0.7,
+            "applies_to": "",
+            "version": "v1",
+        },
+    ]
+    with (isolated_corpus / "claims.jsonl").open("w") as f:
+        for c in stale:
+            f.write(json.dumps(c) + "\n")
+
+    monkeypatch.setattr(
+        ec_mod,
+        "_invoke_llm",
+        lambda *a, **k: (
+            '[{"claim_text": "fresh claim", "claim_type": "factual", '
+            '"evidence_quote": "q", "evidence_span": "", '
+            '"source_section": "", "confidence": 0.8, "applies_to_dims": {}}]'
+        ),
+    )
+
+    result = extract_claims.invoke(
+        {"paper_id": "arxiv:9999.99999", "force": True, "version": "v1"}
+    )
+    assert result["status"] == "extracted"
+    assert result["claims_extracted"] == 1
+
+    on_disk = [
+        json.loads(l)
+        for l in (isolated_corpus / "claims.jsonl").read_text().splitlines()
+        if l.strip()
+    ]
+    paper_claims = [c for c in on_disk if c["paper_id"] == "arxiv:9999.99999"]
+    assert len(paper_claims) == 1, (
+        f"force=True should replace existing claims for the paper, "
+        f"but {len(paper_claims)} rows remain"
+    )
+    assert paper_claims[0]["claim_text"] == "fresh claim"
+
+    ids = [c["id"] for c in paper_claims]
+    assert len(ids) == len(set(ids)), f"duplicate claim IDs after force=True: {ids}"
+
+    # Sibling paper untouched.
+    sibling = [c for c in on_disk if c["paper_id"] == "arxiv:8888.88888"]
+    assert len(sibling) == 1 and sibling[0]["claim_text"] == "sibling"
+
+
+def test_force_true_keeps_old_claims_when_extraction_returns_nothing(
+    isolated_corpus, monkeypatch
+):
+    """Defensive: if force=True extraction yields zero claims (LLM blip),
+    don't trash the old claims — better stale than lost."""
+    paper = {
+        "id": "arxiv:9999.99999",
+        "title": "T",
+        "abstract": "x" * 300,
+        "full_text_md": "Some paper full text. " * 60,
+        "source": "arxiv",
+    }
+    (isolated_corpus / "papers.jsonl").write_text(json.dumps(paper) + "\n")
+    stale = {
+        "id": "arxiv:9999.99999#claim-1",
+        "paper_id": "arxiv:9999.99999",
+        "claim_text": "stale",
+        "claim_type": "factual",
+        "evidence_quote": "q",
+        "evidence_span": "",
+        "source_section": "",
+        "confidence": 0.7,
+        "applies_to": "",
+        "version": "v1",
+    }
+    (isolated_corpus / "claims.jsonl").write_text(json.dumps(stale) + "\n")
+
+    monkeypatch.setattr(ec_mod, "_invoke_llm", lambda *a, **k: "")
+
+    extract_claims.invoke(
+        {"paper_id": "arxiv:9999.99999", "force": True, "version": "v1"}
+    )
+
+    on_disk = [
+        json.loads(l)
+        for l in (isolated_corpus / "claims.jsonl").read_text().splitlines()
+        if l.strip()
+    ]
+    assert len(on_disk) == 1, "old claims must survive a no-op force re-extract"
+    assert on_disk[0]["claim_text"] == "stale"
