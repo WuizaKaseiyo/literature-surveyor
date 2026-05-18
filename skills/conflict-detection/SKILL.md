@@ -12,25 +12,31 @@ autoload: false
 
 定义：两个 claim 在**同一 setting 下**给出**互相反驳**的结论。
 
-### 检测算法
+### 用 `detect_conflicts` 工具，不要手写
 
 ```python
-for claim_a in all_claims:
-    for claim_b in all_claims:
-        if claim_a.paper_id == claim_b.paper_id:
-            continue
-        # 同 setting 检查
-        if not _same_setting(claim_a.applies_to, claim_b.applies_to):
-            continue
-        # 反驳检查（用 LLM 判，不能纯字符串）
-        if _contradicts(claim_a.claim_text, claim_b.claim_text):
-            yield Conflict(
-                claim_a_id=claim_a.id,
-                claim_b_id=claim_b.id,
-                description="...",
-                resolution_attempts=[],  # 后续 paper 是否解决了？
-            )
+result = detect_conflicts(
+    paper_ids=None,            # 默认扫所有；可限定到 Stage 2 本批 paper
+    use_llm=True,               # 关闭则只返回 candidate pair（dry-run）
+    model="openai/gpt-4o-mini",
+    level_filter=None,          # 可选：只要 "direct" / "methodological" 等
+    min_topic_jaccard=0.08,     # claim_text token Jaccard 下限
+    max_pairs=50,               # LLM judge 调用次数硬上限
+)
+# result["conflicts"]: list[Conflict dict]
+# result["candidates_screened"]: 经 filter 的候选 pair 数
+# result["candidates_judged"]: 实际过 LLM 的对数
 ```
+
+工具内部 filter chain：
+1. 不同 paper_id
+2. 不是双 conjecture（speculation × speculation 不算矛盾）
+3. `applies_to_dims` 至少有一个 key 双方都填且值有重叠（双向 substring）
+4. claim_text token Jaccard ≥ `min_topic_jaccard`
+5. 按 topic overlap 排序，前 `max_pairs` 进 LLM judge
+
+**前置依赖**：`extract_claims version="v2"` 必须填 `applies_to_dims`。v1 的
+free-form `applies_to` 字符串不能用，filter 会全部跳过。
 
 ### Conflict 的 4 个等级
 
@@ -45,15 +51,23 @@ direct 和 methodological 是 Stage 3 最值钱的；scope 次之；temporal 单
 
 ### 输出 Conflict Schema
 
+`detect_conflicts` 返回的字典直接匹配 `schemas.literature_survey_schema.Conflict`，
+可以直接灌进 `stage2.json` 的 `conflicts: []`：
+
 ```json
 {
   "id": "conflict-001",
-  "level": "direct" | "methodological" | "scope" | "temporal",
-  "claim_a": {"paper_id": "...", "text": "..."},
-  "claim_b": {"paper_id": "...", "text": "..."},
-  "shared_setting": "...",
-  "description": "...",
-  "stage3_hint": "可让 Stage 3 验证哪种条件下哪边正确"
+  "level": "direct",
+  "claim_a_id": "2305.18290#claim-7",
+  "claim_a_paper_id": "2305.18290",
+  "claim_a_text": "...",
+  "claim_b_id": "2401.99999#claim-3",
+  "claim_b_paper_id": "2401.99999",
+  "claim_b_text": "...",
+  "shared_setting": "model_size=7B, method=PPO, dataset=MMLU",
+  "description": "claim_a reports +5pp; claim_b reports -3pp on same setup",
+  "confidence": 0.85,
+  "topic_overlap": 0.42
 }
 ```
 

@@ -2,11 +2,115 @@
 
 from __future__ import annotations
 
+import json
+from unittest.mock import patch
+
 from tools.corpus_store.corpus_store import corpus_add_paper
 from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
     fact_check_rendered_survey,
     parse_attributions,
 )
+
+
+def _write_claims(corpus_dir, claims):
+    path = corpus_dir / "claims.jsonl"
+    with path.open("w") as f:
+        for c in claims:
+            f.write(json.dumps(c, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Verdict-rank aggregation + E5 strictness invariants (regression guard)
+# ---------------------------------------------------------------------------
+
+
+def test_rollup_rank_aggregation_matrix():
+    """Every unordered verdict pair gets rolled up to a deterministic final.
+
+    The expected map below pins the *semantic* contract — change the map ONLY
+    if you intend to change behavior. The map is duplicated from
+    `_ROLLUP_RANK`'s semantics so a silent rank reshuffle is caught here.
+    """
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _aggregate_attributions,
+        _ROLLUP_RANK,
+    )
+    import itertools
+
+    verdicts = [
+        "supported", "partially_supported", "contradicted", "unsupported",
+        "source_irrelevant", "source_not_in_corpus", "no_source_text", "judge_error",
+    ]
+    for v1, v2 in itertools.combinations_with_replacement(verdicts, 2):
+        items = [
+            {"attribution_id": "a", "claim_text": "x", "verdict": v1, "citation_id": "p1"},
+            {"attribution_id": "a", "claim_text": "x", "verdict": v2, "citation_id": "p2"},
+        ]
+        per_attr = _aggregate_attributions(items)
+        assert len(per_attr) == 1
+        final = per_attr[0]["final_verdict"]
+        # The contract: max rank wins. If two verdicts tie, max() picks
+        # the first occurrence in iteration order.
+        expected = max((v1, v2), key=lambda v: _ROLLUP_RANK[v])
+        assert final == expected, (
+            f"rollup of [{v1}, {v2}] → {final}, expected {expected}"
+        )
+
+
+def test_rollup_rank_key_contract():
+    """Verbose pinning of the EXACT rollup semantics for review pairs that
+    matter. Reviewers should look at this table to understand intent."""
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _aggregate_attributions,
+    )
+    # (verdict_a, verdict_b) → expected_final
+    cases = [
+        ("supported",            "contradicted",         "supported"),         # one good cite trumps a bad one
+        ("supported",            "unsupported",          "supported"),
+        ("partially_supported",  "contradicted",         "partially_supported"),
+        ("partially_supported",  "unsupported",          "partially_supported"),
+        # Among rejection-class verdicts, "contradicted" (active opposition) is
+        # MORE informative than "unsupported" (mere absence), so the rollup
+        # display surfaces it. Talent action differs.
+        ("unsupported",          "contradicted",         "contradicted"),
+        ("source_irrelevant",    "contradicted",         "contradicted"),
+        ("source_not_in_corpus", "unsupported",          "unsupported"),
+        ("source_not_in_corpus", "no_source_text",       "source_not_in_corpus"),
+        ("judge_error",          "supported",            "supported"),
+        ("judge_error",          "judge_error",          "judge_error"),
+    ]
+    for v_a, v_b, expected in cases:
+        items = [
+            {"attribution_id": "x", "claim_text": "c", "verdict": v_a, "citation_id": "p1"},
+            {"attribution_id": "x", "claim_text": "c", "verdict": v_b, "citation_id": "p2"},
+        ]
+        per_attr = _aggregate_attributions(items)
+        assert per_attr[0]["final_verdict"] == expected, (
+            f"[{v_a}, {v_b}] → {per_attr[0]['final_verdict']}, want {expected}"
+        )
+
+
+def test_strictness_rank_invariants():
+    """E5 retry uses _STRICTNESS_RANK with `new < orig → take retry` semantics.
+    These invariants encode "we never relax, and we DO escalate to contradicted"."""
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _STRICTNESS_RANK as S,
+    )
+    # 1. supported is the LEAST strict (highest rank)
+    assert max(S, key=S.get) == "supported"
+    # 2. contradicted is the MOST strict (lowest rank)
+    assert min(S, key=S.get) == "contradicted"
+    # 3. The whole supportiveness ladder: supported > partial > unsupported > contradicted
+    assert S["supported"] > S["partially_supported"]
+    assert S["partially_supported"] > S["unsupported"]
+    assert S["unsupported"] > S["contradicted"]
+    # 4. Critical for C1 fix: retry escalation unsupported → contradicted MUST trigger
+    #    `new(contradicted) < orig(unsupported)` for the retry to take effect.
+    assert S["contradicted"] < S["unsupported"], (
+        "C1 regression: E5 retry will fail to escalate unsupported → contradicted"
+    )
+    # 5. Mirror: retry relaxation contradicted → supported MUST NOT trigger.
+    assert S["supported"] > S["contradicted"]
 
 
 def test_parse_backward_attribution():
@@ -22,6 +126,36 @@ def test_parse_backward_attribution():
     assert attrs[0]["claim_text"] == "The paper studies attention in small language models"
     assert attrs[1]["claim_text"].startswith("Pruning attention heads")
     assert all(a["citations"][0]["id"] == "2401.12345" for a in attrs)
+
+
+def test_parser_ignores_evidence_footnote():
+    """G段 evidence footnote format must not be parsed as a second attribution.
+
+    The convention from systematic-review/SKILL.md is:
+        Some finding [Author, arxiv:ID].
+
+        > evidence: "verbatim quote"
+        > — Section N (arxiv:ID#claim-K)
+
+    The blockquote uses parens around the claim ref, so it should:
+      (a) not match the [author, arxiv:id] cite regex
+      (b) be dropped because no cite anchors the paragraph
+    """
+    md = (
+        "DPO matches PPO on summarization "
+        "[Rafailov et al. 2023, arxiv:2305.18290].\n"
+        "\n"
+        "> evidence: \"matches or improves response quality in summarization\"\n"
+        "> — Section 6, Table 1 (arxiv:2305.18290#claim-3)\n"
+    )
+    attrs = parse_attributions(md)
+    # exactly 1 attribution: the finding sentence
+    assert len(attrs) == 1
+    assert attrs[0]["citations"][0]["id"] == "2305.18290"
+    # the #claim-3 ref inside parens must NOT be parsed as a cite
+    for a in attrs:
+        for c in a["citations"]:
+            assert "claim" not in c["id"]
 
 
 def test_parser_ignores_code_blocks():
@@ -74,10 +208,729 @@ def test_fact_check_catches_numeric_mismatch(isolated_corpus, fake_paper):
     assert "50" in res["items"][0]["explanation"]
 
 
+# ---------------------------------------------------------------------------
+# E2 — unit-aware number matching in heuristic judge
+# ---------------------------------------------------------------------------
+
+
+def test_e2_tolerance_accepts_near_value(isolated_corpus, fake_paper):
+    """Claim "31% reduction" should NOT be flagged when source says "30%"
+    — within the 5% relative tolerance band."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "Pruning attention heads reduces latency by 31% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    item = res["items"][0]
+    assert item["verdict"] != "unsupported", (
+        f"31% should be within tolerance of 30%; got {item['verdict']}"
+    )
+
+
+def test_e2_recognizes_percent_word_form(isolated_corpus, fake_paper):
+    """`30 percent` in source should be canonicalized as 30% and match claim's
+    `30%` — heuristic shouldn't be defeated by word vs symbol."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning reduces latency by 30 percent in language models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    item = res["items"][0]
+    assert item["verdict"] != "unsupported"
+
+
+def test_e2_unit_mismatch_still_caught(isolated_corpus, fake_paper):
+    """Different units mean different things — 1M params ≠ 1B params even
+    though the digit "1" is the same."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "We trained 1M-parameter models on synthetic data with attention heads."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "We trained 1B-parameter models on synthetic data with attention heads "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    item = res["items"][0]
+    # Should not be supported — 1B vs 1M is a 1000× difference, definitely outside tolerance
+    assert item["verdict"] in {"unsupported", "partially_supported"}, item
+
+
+def test_e2_outside_tolerance_still_unsupported(isolated_corpus, fake_paper):
+    """Sanity-preserve: 50% claim against 30% source is still wrong."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "Pruning attention heads reduces latency by 50% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["unsupported_count"] == 1
+    assert "50" in res["items"][0]["explanation"]
+
+
+def test_e2_extract_helper_unit_table():
+    """Direct test of _extract_numbers_with_unit canonicalization."""
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _extract_numbers_with_unit,
+    )
+    cases = {
+        "30%": [(30.0, "%")],
+        "30 percent reduction": [(30.0, "%")],
+        "30 pct": [(30.0, "%")],
+        "1.5B params": [(1.5, "B")],
+        "7B and 13B": [(7.0, "B"), (13.0, "B")],
+        "the rate was 30": [(30.0, "")],
+        "no numbers here": [],
+    }
+    for text, expected in cases.items():
+        got = _extract_numbers_with_unit(text)
+        assert got == expected, f"{text!r} → {got}, want {expected}"
+
+
 def test_fact_check_requires_cited_paper_in_corpus(isolated_corpus):
     md = "A real-looking claim [Smith et al. 2024, arxiv:2401.12345]."
     res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
 
     assert res["source_not_in_corpus_count"] == 1
     assert res["blocking_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# E1 — claim-anchored path (PR-3)
+# ---------------------------------------------------------------------------
+
+
+def test_anchors_to_matched_claim_when_available(isolated_corpus, fake_paper):
+    """When claims.jsonl has a strong match, the result records matched_claim_id
+    and surfaces the claim's verbatim evidence_quote (not a BM25 top sentence)."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Section 4.2 establishes that pruning attention heads in small models "
+        "leads to noticeable speedups. Specific numbers in Table 3."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    _write_claims(isolated_corpus, [
+        {
+            "id": "2401.12345#claim-1",
+            "paper_id": "2401.12345",
+            "claim_text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "claim_type": "factual",
+            "evidence_span": "Section 4.2, Table 3",
+            "evidence_quote": "Pruning attention heads leads to 30% latency reduction in 1B-7B models.",
+            "source_section": "Section 4.2",
+            "confidence": 0.85,
+            "applies_to": "models 1B-7B",
+        },
+    ])
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in language models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    assert res["total_checked"] == 1
+    item = res["items"][0]
+    assert item["matched_claim_id"] == "2401.12345#claim-1"
+    assert "30% latency reduction" in item["matched_claim_quote"]
+    # The surface evidence_quote is the matched claim's verbatim quote.
+    assert item["evidence_quote"] == item["matched_claim_quote"]
+
+
+def test_falls_back_to_bm25_when_no_claim_matches(isolated_corpus, fake_paper):
+    """Claims exist but none overlap the sentence — anchor is skipped, BM25 path
+    runs, matched_claim_id stays empty."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    _write_claims(isolated_corpus, [
+        {
+            "id": "2401.12345#claim-1",
+            "paper_id": "2401.12345",
+            "claim_text": "Carbon emissions during pretraining were offset by Meta sustainability programs.",
+            "claim_type": "factual",
+            "evidence_span": "Section 2.2.1",
+            "evidence_quote": "Total emissions were fully offset.",
+            "source_section": "Section 2.2.1",
+            "confidence": 0.7,
+            "applies_to": "Llama 2 pretraining",
+        },
+    ])
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    item = res["items"][0]
+    assert item["matched_claim_id"] == ""
+    assert item["matched_claim_quote"] == ""
+    # Still passes via BM25 + heuristic since abstract supports the claim.
+    assert res["supported_count"] == 1
+
+
+def test_no_claims_file_no_regression(isolated_corpus, fake_paper):
+    """claims.jsonl absent: old behavior preserved, matched_* fields are empty."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    item = res["items"][0]
+    assert item["matched_claim_id"] == ""
+    assert item["matched_claim_quote"] == ""
+    assert res["supported_count"] == 1
+
+
+def test_e2e_finding_claim_ids_match_factcheck_matched_claim_id(isolated_corpus, fake_paper):
+    """G段 闭环：Finding 声明的 claim_ids 应该和 fact_check 实际找到的 matched_claim_id 一致。
+
+    这是 step 9 的交叉校验流程的 happy path 测试 —— 验证 SKILL.md 里 step 7.5
+    (写 finding 前 claim_search) 和 step 9 (fact_check 后核对 matched_claim_id)
+    数据闭环。
+    """
+    # 1. corpus 里放一篇 paper + 一条 backing claim
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "DPO matches or improves response quality vs PPO-based RLHF on "
+        "summarization and single-turn dialogue tasks."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    backing_claim = {
+        "id": "2401.12345#claim-3",
+        "paper_id": "2401.12345",
+        "claim_text": "DPO matches or improves response quality vs PPO-based RLHF on summarization.",
+        "claim_type": "factual",
+        "evidence_span": "Section 6, Table 1",
+        "evidence_quote": (
+            "matches or improves response quality in summarization "
+            "and single-turn dialogue with significantly less compute"
+        ),
+        "source_section": "Section 6",
+        "confidence": 0.85,
+        "applies_to": "GPT-2 large, summarization",
+    }
+    _write_claims(isolated_corpus, [backing_claim])
+
+    # 2. talent 在 stage2.json 里写的 Finding（含 claim_ids）
+    from schemas.literature_survey_schema import CitationRef, Finding
+    finding = Finding(
+        text="DPO matches PPO-based RLHF on summarization quality.",
+        cites=[CitationRef(paper_id="2401.12345", cite_text="Smith et al. 2024, arxiv:2401.12345")],
+        claim_ids=["2401.12345#claim-3"],
+    )
+    assert finding.claim_ids == ["2401.12345#claim-3"]
+
+    # 3. talent 按 G2 约定渲染 markdown（finding + evidence footnote）
+    rendered = (
+        f"{finding.text[:-1]} [Smith et al. 2024, arxiv:2401.12345].\n\n"
+        f"> evidence: \"{backing_claim['evidence_quote']}\"\n"
+        f"> — {backing_claim['source_section']} (arxiv:{backing_claim['paper_id']}#claim-3)\n"
+    )
+
+    # 4. fact_check 跑
+    res = fact_check_rendered_survey.invoke({"markdown": rendered, "use_llm": False})
+
+    # 5. 只 parse 出 1 个 attribution（footnote 没被算第二条）
+    assert res["total_checked"] == 1, res["items"]
+
+    # 6. matched_claim_id 真的命中了 Finding 声明的那条
+    item = res["items"][0]
+    assert item["matched_claim_id"] == "2401.12345#claim-3"
+    assert item["matched_claim_id"] in finding.claim_ids, (
+        f"cross-check failed: fact_check matched {item['matched_claim_id']} "
+        f"but Finding.claim_ids = {finding.claim_ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# E3 — multi-cite attribution aggregation (PR-?, post-A2)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_cite_supported_wins_over_missing(isolated_corpus, fake_paper):
+    """Sentence with two cites — A in corpus and supports, B not in corpus.
+    Per-cite items: 1 supported + 1 source_not_in_corpus. Per-attribution
+    rollup: supported (non-blocking). blocking_count should be 0."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345][Wang et al. 2024, arxiv:9999.99999]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+
+    # Two per-cite items, but exactly one rolled-up attribution
+    assert res["total_checked"] == 2
+    assert res["total_attributions"] == 1
+    assert res["blocking_count"] == 0, "supported cite should non-block the attribution"
+    assert res["blocking_cite_count"] >= 1, "the missing cite still counts in legacy per-cite view"
+
+    per = res["per_attribution"][0]
+    assert per["final_verdict"] == "supported"
+    assert len(per["sub_results"]) == 2
+    verdicts = {s["verdict"] for s in per["sub_results"]}
+    assert "supported" in verdicts
+    assert "source_not_in_corpus" in verdicts
+
+
+def test_multi_cite_all_bad_stays_blocking(isolated_corpus):
+    """Sentence with two cites, both unresolved → attribution still blocking."""
+    md = (
+        "Some claim [Anonymous 2024, arxiv:1111.11111]"
+        "[Anonymous 2024, arxiv:2222.22222]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["total_attributions"] == 1
+    assert res["blocking_count"] == 1
+    per = res["per_attribution"][0]
+    assert per["final_verdict"] == "source_not_in_corpus"
+
+
+def test_single_cite_backward_compat(isolated_corpus, fake_paper):
+    """Single-cite case: total_attributions equals total_checked, behavior
+    identical to pre-E3."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["total_checked"] == res["total_attributions"] == 1
+    assert res["blocking_count"] == 0
+    assert res["blocking_count"] == res["blocking_cite_count"], (
+        "no multi-cite: attribution and per-cite blocking should agree"
+    )
+
+
+# ---------------------------------------------------------------------------
+# E5 — low-confidence retry with expanded context
+# ---------------------------------------------------------------------------
+
+
+def _setup_e5_paper(isolated_corpus, fake_paper) -> str:
+    """Common fixture for E5 tests: a paper + a single cite markdown.
+
+    full_text_md needs to be long enough that the 6K vs 12K BM25 windows
+    actually differ; we pad with sentences that share zero tokens with the
+    claim so BM25 ranks them at the bottom and only the expanded window picks
+    them up.
+    """
+    paper = dict(fake_paper)
+    # Many relevant sentences so the BM25 6K window fills up, and many
+    # irrelevant ones so the expansion budget materially changes the context.
+    pruning_sents = [
+        f"Pruning attention heads reduces latency by 30% in models below 7B (run {i})."
+        for i in range(60)
+    ]
+    filler_sents = [
+        f"Tokenizer vocabulary size {i} affects throughput unrelated to attention."
+        for i in range(60)
+    ]
+    paper["full_text_md"] = " ".join(pruning_sents + filler_sents)
+    corpus_add_paper.invoke({"paper": paper})
+    return (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+
+
+def test_e5_low_confidence_retry_takes_stricter(isolated_corpus, fake_paper):
+    """LLM first returns partially_supported w/ low confidence → retry returns
+    contradicted (stricter). Result should flip to contradicted."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append({"context_len": len(context)})
+        if len(judge_calls) == 1:
+            return {
+                "verdict": "partially_supported",
+                "confidence": 0.4,
+                "evidence_quote": "snippet",
+                "explanation": "first pass",
+                "judge": f"llm:{model}",
+            }
+        return {
+            "verdict": "contradicted",
+            "confidence": 0.85,
+            "evidence_quote": "wider snippet",
+            "explanation": "second pass, fuller context contradicts",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 2, "should retry once on low-confidence partial"
+    assert judge_calls[1]["context_len"] > judge_calls[0]["context_len"], (
+        "retry context should be wider"
+    )
+    item = res["items"][0]
+    assert item["verdict"] == "contradicted"
+    assert item["expanded_retry"] == "took_stricter"
+
+
+def test_e5_low_confidence_retry_kept_original_when_retry_more_lenient(
+    isolated_corpus, fake_paper,
+):
+    """LLM first returns unsupported (0.4) → retry returns supported. Keep
+    original — never relax the verdict via expansion."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        if len(judge_calls) == 1:
+            return {
+                "verdict": "unsupported",
+                "confidence": 0.45,
+                "evidence_quote": "first",
+                "explanation": "first pass not finding evidence",
+                "judge": f"llm:{model}",
+            }
+        return {
+            "verdict": "supported",
+            "confidence": 0.9,
+            "evidence_quote": "second",
+            "explanation": "expanded view actually supports",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 2
+    item = res["items"][0]
+    assert item["verdict"] == "unsupported", "kept original stricter verdict"
+    assert item["expanded_retry"] == "kept_original"
+
+
+def test_e5_no_retry_when_high_confidence(isolated_corpus, fake_paper):
+    """LLM verdict confidence >= 0.6 → don't retry."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        return {
+            "verdict": "unsupported",
+            "confidence": 0.85,
+            "evidence_quote": "x",
+            "explanation": "confident",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 1, "high confidence → no retry"
+    assert res["items"][0]["expanded_retry"] == ""
+
+
+def test_e5_no_retry_when_supported(isolated_corpus, fake_paper):
+    """Even low-confidence `supported` should NOT retry — we only retry
+    rejection-leaning verdicts (we're trying to catch missed evidence)."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        return {
+            "verdict": "supported",
+            "confidence": 0.3,
+            "evidence_quote": "x",
+            "explanation": "tentative support",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 1
+    assert res["items"][0]["expanded_retry"] == ""
+
+
+def test_e5_disabled_via_flag(isolated_corpus, fake_paper):
+    """expand_on_low_confidence=False → never retry even on borderline."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        return {
+            "verdict": "partially_supported",
+            "confidence": 0.3,
+            "evidence_quote": "x",
+            "explanation": "still partial",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({
+            "markdown": md,
+            "use_llm": True,
+            "expand_on_low_confidence": False,
+        })
+
+    assert len(judge_calls) == 1, "flag off → no retry"
+
+
+# ---------------------------------------------------------------------------
+# E6 — survey_json fast path (skip markdown parsing)
+# ---------------------------------------------------------------------------
+
+
+def test_e6_survey_json_input_mode(isolated_corpus, fake_paper):
+    """When survey_json is supplied, input_mode reports 'survey_json' and
+    markdown is ignored."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+            "claim_ids": [],
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({
+        "markdown": "",
+        "survey_json": survey,
+        "use_llm": False,
+    })
+    assert res["input_mode"] == "survey_json"
+    assert res["total_attributions"] == 1
+    assert res["total_checked"] == 1
+    item = res["items"][0]
+    assert item["attribution_id"].startswith("finding-")
+    assert item["verdict"] == "supported"
+
+
+def test_e6_survey_json_preferred_claim_used_directly(isolated_corpus, fake_paper):
+    """finding.claim_ids should be used as the anchor directly, skipping
+    token-overlap matching. We seed claims.jsonl with TWO claims for the
+    same paper: a relevant one (would be picked by token-overlap) and an
+    irrelevant one. By declaring the IRRELEVANT one in claim_ids, we should
+    see it used as the anchor — proving preferred path is honored."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    relevant_claim = {
+        "id": "2401.12345#claim-relevant",
+        "paper_id": "2401.12345",
+        "claim_text": "Pruning attention heads reduces latency by 30%.",
+        "claim_type": "factual",
+        "evidence_span": "S1",
+        "evidence_quote": "30% latency reduction",
+        "source_section": "S1",
+        "confidence": 0.9,
+        "applies_to": "models below 7B",
+    }
+    irrelevant_claim = {
+        "id": "2401.12345#claim-irrelevant",
+        "paper_id": "2401.12345",
+        "claim_text": "Carbon footprint of pretraining was 539 tCO2eq.",
+        "claim_type": "factual",
+        "evidence_span": "S9",
+        "evidence_quote": "Total: 539 tCO2eq",
+        "source_section": "S9",
+        "confidence": 0.85,
+        "applies_to": "pretraining",
+    }
+    _write_claims(isolated_corpus, [relevant_claim, irrelevant_claim])
+
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+            "claim_ids": ["2401.12345#claim-irrelevant"],  # deliberate "wrong" pick
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({
+        "survey_json": survey,
+        "use_llm": False,
+    })
+    item = res["items"][0]
+    assert item["matched_claim_id"] == "2401.12345#claim-irrelevant", (
+        "fast path must honor declared claim_id, not re-rank by token overlap"
+    )
+
+
+def test_e6_falls_back_to_token_overlap_when_no_preferred(isolated_corpus, fake_paper):
+    """If finding.claim_ids is empty, the matcher should still find the
+    relevant claim by token-overlap (legacy behavior)."""
+    paper = dict(fake_paper)
+    paper["abstract"] = "Pruning reduces latency by 30%."
+    corpus_add_paper.invoke({"paper": paper})
+
+    relevant = {
+        "id": "2401.12345#claim-1",
+        "paper_id": "2401.12345",
+        "claim_text": "Pruning attention heads reduces latency by 30%.",
+        "claim_type": "factual",
+        "evidence_span": "S1",
+        "evidence_quote": "30% latency reduction",
+        "source_section": "S1",
+        "confidence": 0.9,
+        "applies_to": "7B",
+    }
+    _write_claims(isolated_corpus, [relevant])
+
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+            "claim_ids": [],  # none declared → matcher fallback
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({"survey_json": survey, "use_llm": False})
+    assert res["items"][0]["matched_claim_id"] == "2401.12345#claim-1"
+
+
+def test_e6_empty_findings_returns_empty(isolated_corpus):
+    res = fact_check_rendered_survey.invoke({"survey_json": {"findings": []}})
+    assert res["input_mode"] == "survey_json"
+    assert res["total_attributions"] == 0
+    assert res["total_checked"] == 0
+
+
+def test_e6_markdown_still_works_when_no_survey_json(isolated_corpus, fake_paper):
+    """No survey_json supplied → fall back to markdown path. input_mode
+    should reflect 'markdown'."""
+    paper = dict(fake_paper)
+    paper["abstract"] = "Pruning reduces latency by 30%."
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["input_mode"] == "markdown"
+    assert res["total_attributions"] == 1
+
+
+def test_e6_survey_json_takes_precedence_over_markdown(isolated_corpus, fake_paper):
+    """If BOTH supplied, survey_json wins."""
+    paper = dict(fake_paper)
+    paper["abstract"] = "Pruning reduces latency by 30%."
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = "Stuff that should be ignored [Other 2024, arxiv:9999.99999]."
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30%.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({
+        "markdown": md,
+        "survey_json": survey,
+    })
+    assert res["input_mode"] == "survey_json"
+    assert res["items"][0]["citation_id"] == "2401.12345"
+
+
+def test_use_extracted_claims_false_skips_anchor(isolated_corpus, fake_paper):
+    """Explicitly disabling extracted claims keeps the BM25-only baseline path."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    _write_claims(isolated_corpus, [
+        {
+            "id": "2401.12345#claim-1",
+            "paper_id": "2401.12345",
+            "claim_text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "claim_type": "factual",
+            "evidence_span": "Section 4.2",
+            "evidence_quote": "30% latency reduction in pruned attention heads.",
+            "source_section": "Section 4.2",
+            "confidence": 0.85,
+            "applies_to": "1B-7B",
+        },
+    ])
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({
+        "markdown": md,
+        "use_llm": False,
+        "use_extracted_claims": False,
+    })
+
+    item = res["items"][0]
+    assert item["matched_claim_id"] == ""
+    assert item["matched_claim_quote"] == ""
 

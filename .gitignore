@@ -33,7 +33,15 @@ htmlcov/
 corpus/
 *.jsonl.bak
 
+# Whitelist test fixture corpora (committed seed data, not runtime artifacts)
+!tests/fixtures/**/corpus/
+!tests/fixtures/**/corpus/**
+
 # Test artifacts
 tests/_tmp/
 tests/.cache/
 .venv/
+
+# LLM run outputs (regeneratable, can be large) — keep the scripts, drop the runs
+tests/e2e/smoke_runs/
+tests/eval/reports/

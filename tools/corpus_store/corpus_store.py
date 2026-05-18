@@ -19,6 +19,9 @@ because OMC sets CWD to the project workspace before invoking tools.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -33,6 +36,9 @@ from langchain_core.tools import tool
 CORPUS_FILENAME = "papers.jsonl"
 INDEX_FILENAME = "corpus_index.json"
 CLAIMS_FILENAME = "claims.jsonl"
+REFS_FILENAME = "refs.jsonl"
+PROJECT_META_FILENAME = "project_meta.json"
+GLOBAL_LOCK_FILENAME = ".lock"
 
 # Tokenization regex — alphanumeric + apostrophe-aware
 _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9'-]*")
@@ -44,8 +50,53 @@ _STOP = frozenset(
 )
 
 
+def _in_layered_mode() -> bool:
+    """A2: layered mode is opt-in via LITSURVEY_GLOBAL_CORPUS_DIR.
+
+    When unset, behavior is legacy single-tenant (current users see no change).
+    When set, entities (papers, claims, indices) live in the global dir and
+    each project records its reference set in refs.jsonl.
+    """
+    return bool(os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR"))
+
+
+def _global_dir() -> Path:
+    """A2: shared entity store (papers, claims, indices) across projects."""
+    p = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
+    if p:
+        path = Path(p).expanduser()
+    else:
+        path = Path.home() / ".litsurvey_corpus_global"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _project_dir() -> Path | None:
+    """A2: per-project ref store. Returns None when no project context is
+    detectable (standalone scripts / global-only operation)."""
+    p = os.getenv("LITSURVEY_CORPUS_DIR")
+    if p:
+        path = Path(p).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    if _looks_like_workspace():
+        path = Path.cwd() / "corpus"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    return None
+
+
 def _corpus_dir() -> Path:
-    """Resolve corpus directory. Auto-creates if missing."""
+    """Resolve the canonical entity-store directory.
+
+    - Legacy mode (no LITSURVEY_GLOBAL_CORPUS_DIR): returns the project dir
+      (or fallback ~/.litsurvey_corpus/) — single-tenant, all data co-located.
+      Existing tests + existing users are unaffected.
+    - Layered mode: returns the global dir. Papers/claims/indices live here;
+      project refs live in `_project_dir()`.
+    """
+    if _in_layered_mode():
+        return _global_dir()
     p = os.getenv("LITSURVEY_CORPUS_DIR")
     if p:
         path = Path(p).expanduser()
@@ -66,6 +117,90 @@ def _looks_like_workspace() -> bool:
         or (cwd / "task_tree.yaml").exists()
         or (cwd.parent / "task_tree.yaml").exists()
     )
+
+
+# ---------------------------------------------------------------------------
+# A2/A3: project refs + write lock for the shared global store
+# ---------------------------------------------------------------------------
+
+
+def _project_id() -> str:
+    """Stable project ID derived from the absolute project directory path."""
+    pd = _project_dir()
+    if pd is None:
+        return ""
+    abs_path = str(pd.resolve())
+    return hashlib.sha256(abs_path.encode()).hexdigest()[:12]
+
+
+def _ensure_project_meta() -> None:
+    pd = _project_dir()
+    if pd is None:
+        return
+    meta_path = pd / PROJECT_META_FILENAME
+    if meta_path.exists():
+        return
+    meta_path.write_text(json.dumps({
+        "project_id": _project_id(),
+        "project_path": str(pd.resolve()),
+        "created_at": time.time(),
+        "retired_paper_ids": [],
+    }, ensure_ascii=False, indent=2))
+
+
+def _load_project_refs() -> list[dict]:
+    pd = _project_dir()
+    if pd is None:
+        return []
+    path = pd / REFS_FILENAME
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _project_ref_paper_ids() -> set[str]:
+    return {r["paper_id"] for r in _load_project_refs() if r.get("paper_id")}
+
+
+def _append_project_ref(ref: dict) -> None:
+    pd = _project_dir()
+    if pd is None:
+        return
+    _ensure_project_meta()
+    path = pd / REFS_FILENAME
+    with path.open("a") as f:
+        f.write(json.dumps(ref, ensure_ascii=False) + "\n")
+
+
+@contextlib.contextmanager
+def _global_write_lock():
+    """fcntl-based exclusive write lock for the global store.
+
+    Wraps (read existing → mutate → write back) so concurrent OMC processes
+    don't tear lines or clobber each other's index updates. No-op in legacy
+    mode (no global store contention to worry about).
+    """
+    if not _in_layered_mode():
+        yield
+        return
+    lock_path = _global_dir() / GLOBAL_LOCK_FILENAME
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -120,8 +255,14 @@ def _load_index() -> dict:
 
 
 def _save_index(idx: dict) -> None:
+    """Atomic write — tmp + rename so a concurrent reader can never see a
+    truncated JSON file mid-write. POSIX guarantees rename atomicity within
+    the same filesystem; concurrent reads see either the old or the new
+    complete file, never a torn version."""
     path = _corpus_dir() / INDEX_FILENAME
-    path.write_text(json.dumps(idx, ensure_ascii=False))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(idx, ensure_ascii=False))
+    tmp.replace(path)
 
 
 def _update_index_for(paper: dict, idx: dict) -> None:
@@ -145,7 +286,7 @@ def _update_index_for(paper: dict, idx: dict) -> None:
 
 @tool
 def corpus_add_paper(paper: dict[str, Any]) -> dict[str, Any]:
-    """Add a paper to the project corpus. Idempotent (skips if id already present).
+    """Add a paper to the corpus. Idempotent (skips global add if id already present).
 
     Required `paper` fields:
         id: unique identifier (arxiv_id / DOI / S2 paper_id / openalex_id)
@@ -156,8 +297,20 @@ def corpus_add_paper(paper: dict[str, Any]) -> dict[str, Any]:
         full_text_md: str (from pdf_extract), source_query: str (which query found it),
         source: "arxiv" | "semantic_scholar" | "openalex" | "user_upload"
 
-    Returns:
+    In layered mode (LITSURVEY_GLOBAL_CORPUS_DIR set), paper entity goes to the
+    global store; a per-project ref record is appended to refs.jsonl regardless
+    of whether the paper was already in global. This means re-running searches
+    that surface the same paper accumulates per-query audit trail in refs.
+
+    Returns (legacy mode):
         {"status": "added" | "skipped_duplicate", "id": "...", "corpus_size": N}
+    Returns (layered mode):
+        {"status": "added" | "skipped_duplicate",
+         "global_status": "added" | "skipped_duplicate",
+         "project_status": "added_ref" | "rejected",
+         "id": "...",
+         "corpus_size": N,            # project refs count
+         "global_corpus_size": M}
     """
     if not isinstance(paper, dict):
         return {"error": "paper must be a dict", "status": "rejected"}
@@ -167,18 +320,54 @@ def corpus_add_paper(paper: dict[str, Any]) -> dict[str, Any]:
     if not paper.get("title"):
         return {"error": "paper.title is required", "status": "rejected"}
 
-    papers = _load_papers()
-    if any(p.get("id") == pid for p in papers):
-        return {"status": "skipped_duplicate", "id": pid, "corpus_size": len(papers)}
+    layered = _in_layered_mode()
 
-    paper.setdefault("added_at", time.time())
-    _append_paper(paper)
+    with _global_write_lock():
+        papers = _load_papers()
+        already_global = any(p.get("id") == pid for p in papers)
 
-    idx = _load_index()
-    _update_index_for(paper, idx)
-    _save_index(idx)
+        if not already_global:
+            paper.setdefault("added_at", time.time())
+            _append_paper(paper)
+            idx = _load_index()
+            _update_index_for(paper, idx)
+            _save_index(idx)
+            global_size_after = len(papers) + 1
+            global_status = "added"
+        else:
+            global_size_after = len(papers)
+            global_status = "skipped_duplicate"
 
-    return {"status": "added", "id": pid, "corpus_size": len(papers) + 1}
+    # In layered mode, always append a ref so the per-query audit trail is
+    # captured (same paper might be found by multiple queries — that's a signal).
+    project_status = "rejected"
+    project_size_after = 0
+    if layered and _project_dir() is not None:
+        ref = {
+            "paper_id": pid,
+            "source_query": paper.get("source_query", ""),
+            "found_via": paper.get("source", ""),
+            "added_at": time.time(),
+            "kept": True,
+        }
+        _append_project_ref(ref)
+        project_status = "added_ref"
+        project_size_after = len(_project_ref_paper_ids())
+
+    if layered:
+        return {
+            "status": "added" if (global_status == "added" or project_status == "added_ref") else "skipped_duplicate",
+            "global_status": global_status,
+            "project_status": project_status,
+            "id": pid,
+            "corpus_size": project_size_after,
+            "global_corpus_size": global_size_after,
+        }
+
+    # Legacy mode: original return shape preserved exactly.
+    if already_global:
+        return {"status": "skipped_duplicate", "id": pid, "corpus_size": global_size_after}
+    return {"status": "added", "id": pid, "corpus_size": global_size_after}
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +376,8 @@ def corpus_add_paper(paper: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool
-def corpus_search(query: str, top_k: int = 10) -> dict[str, Any]:
-    """Search the local corpus using BM25-lite scoring.
+def corpus_search(query: str, top_k: int = 10, scope: str = "both") -> dict[str, Any]:
+    """Search the corpus using BM25-lite scoring.
 
     Returns the most relevant papers from corpus that match the query terms.
     Use this BEFORE making external API calls — corpus may already have what
@@ -197,21 +386,32 @@ def corpus_search(query: str, top_k: int = 10) -> dict[str, Any]:
     Args:
         query: Free-text query.
         top_k: How many top hits to return. Default 10, max 50.
+        scope: layered-mode scope. "project" = only papers this project has
+            ref'd; "global" = all global papers; "both" (default) = all global
+            with `from_project` tag on each result. Ignored in legacy mode.
 
     Returns:
         {
           "results": [
-            {"paper": {...}, "score": 12.3, "matched_terms": ["x", "y"]},
+            {"paper": {...}, "score": 12.3, "matched_terms": ["x", "y"],
+             "from_project": True}  # in layered mode only
             ...
           ],
           "total_corpus_size": N,
-          "query": "..."
+          "query": "...",
+          # layered mode only:
+          "project_corpus_size": K,
+          "global_corpus_size": M,
         }
     """
     if not query or not query.strip():
         return {"error": "empty query", "results": [], "total_corpus_size": 0}
 
     top_k = max(1, min(int(top_k), 50))
+    layered = _in_layered_mode()
+    scope_norm = scope.strip().lower() if scope else "both"
+    if scope_norm not in {"project", "global", "both"}:
+        scope_norm = "both"
 
     papers = _load_papers()
     if not papers:
@@ -221,6 +421,8 @@ def corpus_search(query: str, top_k: int = 10) -> dict[str, Any]:
     q_tokens = _tokenize(query)
     if not q_tokens:
         return {"results": [], "total_corpus_size": len(papers), "query": query}
+
+    project_refs = _project_ref_paper_ids() if layered else set()
 
     N = max(idx.get("doc_count", len(papers)), 1)
     scores: list[tuple[float, list[str], dict]] = []
@@ -233,6 +435,9 @@ def corpus_search(query: str, top_k: int = 10) -> dict[str, Any]:
 
     for pid, tokens in idx.get("doc_tokens", {}).items():
         if pid not in paper_by_id:
+            continue
+        # Apply project-only filter early to skip scoring papers we'll drop.
+        if layered and scope_norm == "project" and pid not in project_refs:
             continue
         score = 0.0
         matched = []
@@ -249,16 +454,23 @@ def corpus_search(query: str, top_k: int = 10) -> dict[str, Any]:
             scores.append((score, matched, paper_by_id[pid]))
 
     scores.sort(key=lambda x: x[0], reverse=True)
-    results = [
-        {"paper": p, "score": round(s, 3), "matched_terms": m}
-        for s, m, p in scores[:top_k]
-    ]
+    results: list[dict[str, Any]] = []
+    for s, m, p in scores[:top_k]:
+        item: dict[str, Any] = {"paper": p, "score": round(s, 3), "matched_terms": m}
+        if layered:
+            item["from_project"] = p["id"] in project_refs
+        results.append(item)
 
-    return {
+    out: dict[str, Any] = {
         "results": results,
         "total_corpus_size": len(papers),
         "query": query,
     }
+    if layered:
+        out["project_corpus_size"] = len(project_refs)
+        out["global_corpus_size"] = len(papers)
+        out["scope"] = scope_norm
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -272,34 +484,80 @@ def corpus_status() -> dict[str, Any]:
 
     Use this at the START of a Stage 2 task to see if you already have relevant papers.
 
+    In layered mode (LITSURVEY_GLOBAL_CORPUS_DIR set), `corpus_size` is the
+    project's ref count (papers this project has touched); `global_corpus_size`
+    is the cross-project shared pool. Use the latter to spot reuse opportunities.
+
     Returns:
         {
-          "corpus_size": N,
-          "by_source": {"arxiv": 12, "semantic_scholar": 8, ...},
-          "by_year": {"2024": 10, "2023": 8, ...},
+          "corpus_size": N,                # project view (refs) in layered mode, else all papers
+          "by_source": {"arxiv": 12, ...},
+          "by_year": {"2024": 10, ...},
           "with_full_text": K,
           "claims_count": M,
-          "corpus_dir": "/path/to/corpus"
+          "corpus_dir": "/path/to/corpus",
+          # layered mode only:
+          "global_corpus_size": M,
+          "global_claims_count": K,
+          "project_dir": "/path/to/project/corpus",
+          "global_dir": "/path/to/global"
         }
     """
-    papers = _load_papers()
+    layered = _in_layered_mode()
     cd = _corpus_dir()
+
+    all_papers = _load_papers()
     claims_path = cd / CLAIMS_FILENAME
-    claims_count = 0
+    global_claims_count = 0
     if claims_path.exists():
         with claims_path.open() as f:
-            claims_count = sum(1 for line in f if line.strip())
+            global_claims_count = sum(1 for line in f if line.strip())
 
-    by_source = Counter(p.get("source", "unknown") for p in papers)
-    by_year = Counter(str(p.get("year", "unknown")) for p in papers)
-    with_full = sum(1 for p in papers if p.get("full_text_md"))
+    if layered:
+        ref_ids = _project_ref_paper_ids()
+        project_papers = [p for p in all_papers if p.get("id") in ref_ids]
+        by_source = Counter(p.get("source", "unknown") for p in project_papers)
+        by_year = Counter(str(p.get("year", "unknown")) for p in project_papers)
+        with_full = sum(1 for p in project_papers if p.get("full_text_md"))
+        # Project-scope claims count = claims attached to ref'd papers.
+        project_claims_count = 0
+        if claims_path.exists():
+            with claims_path.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        c = json.loads(line)
+                        if c.get("paper_id") in ref_ids:
+                            project_claims_count += 1
+                    except json.JSONDecodeError:
+                        continue
+        pd = _project_dir()
+        return {
+            "corpus_size": len(project_papers),
+            "by_source": dict(by_source),
+            "by_year": dict(by_year),
+            "with_full_text": with_full,
+            "claims_count": project_claims_count,
+            "corpus_dir": str(pd) if pd else str(cd),
+            "global_corpus_size": len(all_papers),
+            "global_claims_count": global_claims_count,
+            "project_dir": str(pd) if pd else "",
+            "global_dir": str(_global_dir()),
+            "mode": "layered",
+        }
 
+    # Legacy: original shape preserved.
+    by_source = Counter(p.get("source", "unknown") for p in all_papers)
+    by_year = Counter(str(p.get("year", "unknown")) for p in all_papers)
+    with_full = sum(1 for p in all_papers if p.get("full_text_md"))
     return {
-        "corpus_size": len(papers),
+        "corpus_size": len(all_papers),
         "by_source": dict(by_source),
         "by_year": dict(by_year),
         "with_full_text": with_full,
-        "claims_count": claims_count,
+        "claims_count": global_claims_count,
         "corpus_dir": str(cd),
     }
 
@@ -313,33 +571,47 @@ def corpus_status() -> dict[str, Any]:
 def corpus_list_papers(
     limit: int = 50,
     source: str = "",
+    scope: str = "project",
 ) -> dict[str, Any]:
     """List papers in the corpus. Optionally filter by source.
 
     Args:
         limit: Max papers to list. Default 50.
         source: Optional source filter ("arxiv" / "semantic_scholar" / etc).
+        scope: layered-mode scope. "project" (default) = papers this project
+            has ref'd; "global" = all global papers; "both" = global with
+            `from_project` tag. Ignored in legacy mode.
 
     Returns:
         {"papers": [{"id": "...", "title": "...", "year": ..., "source": "..."}, ...]}
     """
+    layered = _in_layered_mode()
+    scope_norm = scope.strip().lower() if scope else "project"
+    if scope_norm not in {"project", "global", "both"}:
+        scope_norm = "project"
+
     papers = _load_papers()
+    if layered and scope_norm == "project":
+        ref_ids = _project_ref_paper_ids()
+        papers = [p for p in papers if p.get("id") in ref_ids]
     if source:
         papers = [p for p in papers if p.get("source") == source]
     papers = papers[: max(1, min(int(limit), 200))]
-    return {
-        "papers": [
-            {
-                "id": p.get("id", ""),
-                "title": p.get("title", ""),
-                "year": p.get("year"),
-                "source": p.get("source", ""),
-                "has_full_text": bool(p.get("full_text_md")),
-            }
-            for p in papers
-        ],
-        "count": len(papers),
-    }
+
+    ref_ids = _project_ref_paper_ids() if layered else set()
+    out_papers = []
+    for p in papers:
+        item = {
+            "id": p.get("id", ""),
+            "title": p.get("title", ""),
+            "year": p.get("year"),
+            "source": p.get("source", ""),
+            "has_full_text": bool(p.get("full_text_md")),
+        }
+        if layered:
+            item["from_project"] = p.get("id", "") in ref_ids
+        out_papers.append(item)
+    return {"papers": out_papers, "count": len(out_papers)}
 
 
 # ---------------------------------------------------------------------------

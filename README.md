@@ -12,11 +12,12 @@ Systematic literature review specialist for the [AutoResearch](https://github.co
 
 - **Multi-source academic search** — arxiv (free) + Semantic Scholar (citation-aware, sorted by influence) + OpenAlex (240M works, all fields), concurrent via `parallel_multi_search` with cross-source dedup
 - **PDF → markdown extraction** — `pymupdf4llm` preserves headings, tables, math; auto-fallback to `pypdf`
-- **Per-project corpus** — append-only `papers.jsonl` + BM25-lite index; reusable across rounds
-- **Structured claim extraction** — each paper → 5-15 typed claims with `evidence_span` (section + table refs) + `applies_to` (scope qualifier)
-- **Cross-paper conflict detection** — finds same-setting / contradictory claims (4 levels: direct / methodological / scope / temporal)
-- **Citation verification + attribution fact check** — every `[Author Year, arxiv:X / doi:Y / S2:Z]` cite checked against real APIs, then each final-text claim is checked against the cited paper
-- **Pydantic-validated output** — strict `LiteratureSurveySchema` JSON + rendered markdown
+- **Corpus persistence with cross-project reuse** (opt-in layered mode) — paper + claim entities live in a shared global pool, per-project `refs.jsonl` records which papers each project touched. Re-extracting an already-processed paper short-circuits to `status="reused"` — 0 LLM calls. Unset the env var to keep classic single-tenant behavior.
+- **Structured claim extraction (v2)** — section-aware split (markdown headings) + per-section LLM calls + `evidence_quote` round-trip verification against source + structured `applies_to_dims` (model_size / dataset / domain / language / regime / metric) usable as conflict-detection join key
+- **Claim retrieval** — `claim_store` exposes 5 read-side tools (`claim_search`, `claim_list_by_paper`, `claim_get`, `claim_status`, `claim_find_evidence`); the last anchors `fact_check_rendered_survey` to pre-extracted claims for stricter judgement
+- **Cross-paper conflict detection** — `detect_conflicts` uses `applies_to_dims` as the cheap join key + LLM judge per candidate pair (4 levels: direct / methodological / scope / temporal)
+- **Citation verification + attribution fact check** — every `[Author Year, arxiv:X / doi:Y / S2:Z]` cite checked against real APIs, then each finding (via `survey_json` fast path or markdown) is checked against the cited paper. Per-attribution rollup so a multi-cite sentence with one supportive cite is non-blocking. Low-confidence verdicts trigger an automatic context-expansion retry.
+- **Pydantic-validated output** — strict `LiteratureSurveySchema` JSON + rendered markdown with optional `> evidence: "..."` footnotes anchored to extracted claims
 
 ## Why use this instead of asking GPT directly
 
@@ -43,8 +44,8 @@ OMC's onboarding flow will:
 1. `git clone` this repo into `.onemancompany/talents/literature-surveyor/`
 2. `execute_hire()` creates a new employee directory (e.g. `00015`)
 3. `copy_talent_assets` copies skills/prompts/vessel/manifest into the employee
-4. `register_tool_user` puts 11 tool dirs into `company/assets/tools/` (with `tool.yaml` for tool_registry registration)
-5. `tool_registry.load_asset_tools()` registers 17 LangChain `@tool` functions on next backend start
+4. `register_tool_user` puts 13 tool dirs into `company/assets/tools/` (with `tool.yaml` for tool_registry registration)
+5. `tool_registry.load_asset_tools()` registers 23 LangChain `@tool` functions on next backend start
 6. Backend registers a LangChain agent for the new employee
 
 ### Or, programmatic install
@@ -122,7 +123,7 @@ rm -rf .onemancompany/company/human_resource/employees/00007/
 
 ---
 
-## Tools provided (17)
+## Tools provided (23)
 
 | Tool | Purpose |
 |---|---|
@@ -132,16 +133,23 @@ rm -rf .onemancompany/company/human_resource/employees/00007/
 | `openalex_search` | Search OpenAlex (cross-domain, 240M works) |
 | `parallel_multi_search` | Concurrent 3-source search with dedup by arxiv_id/DOI/title |
 | `pdf_extract` | PDF (URL or path) → markdown via pymupdf4llm |
-| **Corpus persistence** | |
-| `corpus_add_paper` | Add paper to project corpus (idempotent) |
-| `corpus_search` | BM25-lite local search over already-fetched papers |
-| `corpus_status` | Counts + distributions; **call first** in Stage 2 |
-| `corpus_list_papers` | List papers with optional source filter |
-| `corpus_get_paper` | Fetch full record by ID |
+| **Corpus persistence** (layered mode opt-in via `LITSURVEY_GLOBAL_CORPUS_DIR`) | |
+| `corpus_add_paper` | Add paper to global entity store + project refs (idempotent) |
+| `corpus_search` | BM25-lite search; `scope` = project / global / both |
+| `corpus_status` | Counts for both project and global pools; **call first** in Stage 2 |
+| `corpus_list_papers` | List papers with optional source / scope filter |
+| `corpus_get_paper` | Fetch full record by ID (from global) |
+| **Claim retrieval** | |
+| `claim_search` | BM25 over `claim_text + evidence_quote`, filterable by paper + type |
+| `claim_list_by_paper` | Every claim for one paper |
+| `claim_get` | One claim by id (`<paper_id>#claim-N`) |
+| `claim_status` | Total counts, by-type distribution, papers covered |
+| `claim_find_evidence` | Anchor: given a sentence + paper, find best-matching claims |
 | **Quality gates** | |
-| `extract_claims` | LLM-based structured claim extraction (5-15 per paper) |
+| `extract_claims` | v1 single-shot + v2 section-aware extraction. `force=False` short-circuits on cache hit (cross-project reuse) |
 | `verify_citations` | Pre-submission cite verification — blocks hallucinations |
-| `fact_check_rendered_survey` | Final markdown attribution fact check — verifies cited papers support each sentence-level claim |
+| `fact_check_rendered_survey` | Final attribution fact check. Accepts `markdown` or `survey_json`; anchors to extracted claims; per-attribution rollup; low-confidence retry with expanded context |
+| `detect_conflicts` | Cross-paper claim contradictions via `applies_to_dims` join + LLM judge |
 | `self_assess` | Heuristic verdict on whether corpus is sufficient |
 | **Provenance (`run.json`)** | |
 | `run_start` | Begin a run — hash prompts + research question + record model IDs |

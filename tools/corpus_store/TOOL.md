@@ -35,6 +35,24 @@ In priority order:
 
 OMC sets CWD to project workspace before invoking tools, so each project gets an isolated corpus by default.
 
+## Layered mode (cross-project sharing) — opt-in
+
+Set `LITSURVEY_GLOBAL_CORPUS_DIR=~/.litsurvey_corpus_global` (or any path) to
+activate layered mode. When set:
+
+- Paper **entities** live in `<global>/papers.jsonl` (deduped by id, shared across projects)
+- Each project's **reference set** lives in `<project>/refs.jsonl` (one row per add, audit-trailed by source_query)
+- `corpus_search` / `corpus_list_papers` accept `scope=project|global|both` (default `both`)
+- Project-scope counts in `corpus_status` show the project view; `global_*` shows the shared pool
+- `extract_claims` short-circuits on cache hit — papers already extracted in any project don't get re-extracted
+- All entity writes are protected by an fcntl flock so two OMC processes can't tear lines or clobber the index
+
+Migration: `python -m tools.corpus_store.migrate_to_global --source <project>/corpus`
+promotes a legacy single-tenant dir into the global pool and creates the project refs.
+
+When `LITSURVEY_GLOBAL_CORPUS_DIR` is unset, behavior is **exactly** the same as
+before — no change in single-tenant setups.
+
 ## Paper schema
 
 When calling `corpus_add_paper`, pass:

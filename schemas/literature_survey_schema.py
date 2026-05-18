@@ -65,6 +65,17 @@ class Finding(BaseModel):
     text: str = Field(description="The finding statement")
     cites: list[CitationRef]
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    # PR-4 (G段): which extracted claims back this finding. Populated by talent
+    # via claim_search during step 7.5 of systematic-review. Used downstream by
+    # fact_check_rendered_survey to anchor judgement, and by markdown rendering
+    # to surface verbatim evidence footnotes under the finding.
+    claim_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "IDs of extracted claims that back this finding (format "
+            "'<paper_id>#claim-N'). Empty list = unverified / orphan finding."
+        ),
+    )
 
 
 class Conflict(BaseModel):
@@ -116,6 +127,11 @@ class AttributionAuditItem(BaseModel):
     evidence_quote: str = ""
     explanation: str = ""
     judge: str = ""
+    # PR-3 (E1): when fact_check found a pre-extracted claim that anchored the
+    # judgement, these fields record which one. Empty when no anchor was used
+    # (claims.jsonl missing, or no claim matched the sentence well enough).
+    matched_claim_id: str = ""
+    matched_claim_quote: str = ""
 
 
 class AttributionAuditSummary(BaseModel):

@@ -17,6 +17,12 @@ read('stage1_topic_refiner.md')   # 拿到精炼的研究问题 (RQ)
 
 如果 corpus 里已有 ≥ 10 篇相关 paper（用 corpus_search 验证），可以直接进 step 6。
 
+**Layered 模式提示**：如果 `corpus_status()` 返回 `"mode": "layered"`，先用
+`corpus_search(query, scope="global")` 看 global 池（其他项目沉淀的）能不能
+覆盖你的 RQ 一部分 —— `corpus_add_paper` 把它们引入到本项目时**不会重抓 PDF
+也不会重抽 claim**（extract_claims 自动短路复用 global claims，省钱省时间）。
+然后再决定还要补搜哪些。
+
 ## 2. 拆解 query（multi-aspect）
 
 将 RQ 拆成 **3-5 组互补 query**：
@@ -91,6 +97,34 @@ load_skill('conflict-detection')
 - **conflicts** — 跨 paper 矛盾（同一 setup 不同结论）
 - **gaps** — 各 paper 自承的 limitations / future work，且无后继研究
 
+## 7.5 编写 finding 前先用 claim 背书（强制）
+
+**每条 finding 写进 stage2.json 之前**，必须先用 `claim_search` 找到至少 1 条
+（建议 1-3 条）extracted claim 在背书它。否则就是"凭印象写"，下游 fact_check
+会抓到。
+
+```python
+# 草拟 finding 文本（脑内）：
+# "DPO matches or improves response quality vs PPO-based RLHF on summarization"
+
+backing = claim_search(
+    query="DPO PPO summarization response quality",
+    paper_ids=["2305.18290"],   # 你打算挂的那篇
+    top_k=3,
+)
+if not backing["results"]:
+    # 没 claim 背书 → 不能写这条 finding
+    # 选项 A：corpus 里这篇 paper 确实没说这个 → 删掉 finding 或换论据
+    # 选项 B：claim 抽取漏了 → 跑 extract_claims(paper_id, version="v2")
+    pass
+
+claim_ids_backing = [r["claim"]["id"] for r in backing["results"][:3]]
+# 后面写进 Finding.claim_ids
+```
+
+**判断标准**：只用 `claim_search.score` 看相关性还不够，**必须人读一眼 claim_text
+确认它真的在说同一件事**。score 高但话题不同的也存在（特别是同一篇 paper 内）。
+
 ## 8. 输出双格式
 
 **先**生成 `stage2.json`（严格 LiteratureSurveySchema）：
@@ -107,7 +141,14 @@ load_skill('conflict-detection')
   },
   "taxonomy": [...],
   "methods_landscape": [...],
-  "findings": [{"text": "...", "cites": ["arxiv:2401.XXXXX"]}, ...],
+  "findings": [
+    {
+      "text": "DPO matches PPO-based RLHF in summarization quality.",
+      "cites": [{"paper_id": "2305.18290", "cite_text": "Rafailov et al. 2023, arxiv:2305.18290"}],
+      "claim_ids": ["2305.18290#claim-3", "2305.18290#claim-7"],
+      "confidence": 0.85
+    }
+  ],
   "conflicts": [...],
   "open_questions": [...],
   "gaps": [...],
@@ -115,13 +156,48 @@ load_skill('conflict-detection')
 }
 ```
 
+`claim_ids` **不能为空** —— step 7.5 你已经查过，每条 finding 至少 1 条 claim 背书。
+
 **然后**用 schema 渲染人读 markdown 写到 `stage2_literature_surveyor.md`。
+
+### Markdown 渲染约定
+
+每个 finding 一段话 + cite，**强烈建议**紧跟一个 evidence footnote 块（blockquote
+格式），引用 backing claim 的 `evidence_quote` 原文。
+
+```markdown
+DPO matches or improves response quality versus PPO-based RLHF on
+summarization and single-turn dialogue [Rafailov et al. 2023, arxiv:2305.18290].
+
+> evidence: "matches or improves response quality in summarization and single-turn dialogue"
+> — Section 6, Table 1 (arxiv:2305.18290#claim-3)
+```
+
+footnote 格式约束：
+- 用 `> evidence:` 起头（fact_check 的 parser 会忽略 blockquote 里的 cite，避免重复打分）
+- 用 claim 的 `evidence_quote` 原文（带引号），后面 `—` + `source_section` + `(paper_id#claim-N)`
+- 一条 finding 配一条最强的 evidence；多 backing 时挑 confidence/相关性最高的那条
+
+这一步让人读 review 时不用打开 PDF 就能验证。`claim_ids` 写在 JSON 里给下游
+（fact_check / 后续 stage / 跨项目复用）；evidence quote 出现在 markdown 里给人读。
 
 ## 9. 自检（必须）
 
 ```
 cite_result = verify_citations(read('stage2_literature_surveyor.md'))
-fact_result = fact_check_rendered_survey(read('stage2_literature_surveyor.md'), use_llm=True)
+
+# 推荐：用 stage2.json 走 fast path，跳过 markdown 解析的不确定性，且
+# Finding.claim_ids 会被直接当 anchor（更确定，不靠 token-overlap 猜）
+fact_result = fact_check_rendered_survey(
+    survey_json=read_json('stage2.json'),
+    use_llm=True,
+)
+
+# 退路：仅有 markdown（外部 review 场景）
+# fact_result = fact_check_rendered_survey(
+#     markdown=read('stage2_literature_surveyor.md'),
+#     use_llm=True,
+# )
 ```
 
 如果 `cite_result.unverified_count > 0`：
@@ -135,6 +211,16 @@ fact_result = fact_check_rendered_survey(read('stage2_literature_surveyor.md'), 
 2. 删除、改写、或换成真正支持该句的 citation
 3. `partially_supported` 必须降级措辞（如 "shows" → "suggests"）
 4. 重新运行 `fact_check_rendered_survey`，直到 blocking_count == 0
+
+**交叉校验 `matched_claim_id`**：每条 `fact_result.items[i].matched_claim_id`
+（fact_check 真正用来判 verdict 的那条 claim）应该出现在对应 finding 的
+`claim_ids` 里。如果不在：
+
+- `matched_claim_id == ""` 但 finding 的 `claim_ids` 不空 → 你 step 7.5 挂的
+  claim 跟 fact_check 实际找到的不一致，要么 claim 没真在背书要么挂错了
+- `matched_claim_id` 不在 `claim_ids` 里 → fact_check 找到了**别的** claim 在背书；
+  补进 finding 的 `claim_ids`
+- 都对得上 → 数据闭环正确
 
 ## 严禁
 
