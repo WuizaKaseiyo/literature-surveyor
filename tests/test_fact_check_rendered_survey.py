@@ -631,6 +631,180 @@ def test_e5_disabled_via_flag(isolated_corpus, fake_paper):
     assert len(judge_calls) == 1, "flag off → no retry"
 
 
+# ---------------------------------------------------------------------------
+# E6 — survey_json fast path (skip markdown parsing)
+# ---------------------------------------------------------------------------
+
+
+def test_e6_survey_json_input_mode(isolated_corpus, fake_paper):
+    """When survey_json is supplied, input_mode reports 'survey_json' and
+    markdown is ignored."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+            "claim_ids": [],
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({
+        "markdown": "",
+        "survey_json": survey,
+        "use_llm": False,
+    })
+    assert res["input_mode"] == "survey_json"
+    assert res["total_attributions"] == 1
+    assert res["total_checked"] == 1
+    item = res["items"][0]
+    assert item["attribution_id"].startswith("finding-")
+    assert item["verdict"] == "supported"
+
+
+def test_e6_survey_json_preferred_claim_used_directly(isolated_corpus, fake_paper):
+    """finding.claim_ids should be used as the anchor directly, skipping
+    token-overlap matching. We seed claims.jsonl with TWO claims for the
+    same paper: a relevant one (would be picked by token-overlap) and an
+    irrelevant one. By declaring the IRRELEVANT one in claim_ids, we should
+    see it used as the anchor — proving preferred path is honored."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+
+    relevant_claim = {
+        "id": "2401.12345#claim-relevant",
+        "paper_id": "2401.12345",
+        "claim_text": "Pruning attention heads reduces latency by 30%.",
+        "claim_type": "factual",
+        "evidence_span": "S1",
+        "evidence_quote": "30% latency reduction",
+        "source_section": "S1",
+        "confidence": 0.9,
+        "applies_to": "models below 7B",
+    }
+    irrelevant_claim = {
+        "id": "2401.12345#claim-irrelevant",
+        "paper_id": "2401.12345",
+        "claim_text": "Carbon footprint of pretraining was 539 tCO2eq.",
+        "claim_type": "factual",
+        "evidence_span": "S9",
+        "evidence_quote": "Total: 539 tCO2eq",
+        "source_section": "S9",
+        "confidence": 0.85,
+        "applies_to": "pretraining",
+    }
+    _write_claims(isolated_corpus, [relevant_claim, irrelevant_claim])
+
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+            "claim_ids": ["2401.12345#claim-irrelevant"],  # deliberate "wrong" pick
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({
+        "survey_json": survey,
+        "use_llm": False,
+    })
+    item = res["items"][0]
+    assert item["matched_claim_id"] == "2401.12345#claim-irrelevant", (
+        "fast path must honor declared claim_id, not re-rank by token overlap"
+    )
+
+
+def test_e6_falls_back_to_token_overlap_when_no_preferred(isolated_corpus, fake_paper):
+    """If finding.claim_ids is empty, the matcher should still find the
+    relevant claim by token-overlap (legacy behavior)."""
+    paper = dict(fake_paper)
+    paper["abstract"] = "Pruning reduces latency by 30%."
+    corpus_add_paper.invoke({"paper": paper})
+
+    relevant = {
+        "id": "2401.12345#claim-1",
+        "paper_id": "2401.12345",
+        "claim_text": "Pruning attention heads reduces latency by 30%.",
+        "claim_type": "factual",
+        "evidence_span": "S1",
+        "evidence_quote": "30% latency reduction",
+        "source_section": "S1",
+        "confidence": 0.9,
+        "applies_to": "7B",
+    }
+    _write_claims(isolated_corpus, [relevant])
+
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30% in models below 7B.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+            "claim_ids": [],  # none declared → matcher fallback
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({"survey_json": survey, "use_llm": False})
+    assert res["items"][0]["matched_claim_id"] == "2401.12345#claim-1"
+
+
+def test_e6_empty_findings_returns_empty(isolated_corpus):
+    res = fact_check_rendered_survey.invoke({"survey_json": {"findings": []}})
+    assert res["input_mode"] == "survey_json"
+    assert res["total_attributions"] == 0
+    assert res["total_checked"] == 0
+
+
+def test_e6_markdown_still_works_when_no_survey_json(isolated_corpus, fake_paper):
+    """No survey_json supplied → fall back to markdown path. input_mode
+    should reflect 'markdown'."""
+    paper = dict(fake_paper)
+    paper["abstract"] = "Pruning reduces latency by 30%."
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["input_mode"] == "markdown"
+    assert res["total_attributions"] == 1
+
+
+def test_e6_survey_json_takes_precedence_over_markdown(isolated_corpus, fake_paper):
+    """If BOTH supplied, survey_json wins."""
+    paper = dict(fake_paper)
+    paper["abstract"] = "Pruning reduces latency by 30%."
+    corpus_add_paper.invoke({"paper": paper})
+
+    md = "Stuff that should be ignored [Other 2024, arxiv:9999.99999]."
+    survey = {
+        "findings": [{
+            "text": "Pruning attention heads reduces latency by 30%.",
+            "cites": [{
+                "paper_id": "2401.12345",
+                "cite_text": "Smith et al. 2024, arxiv:2401.12345",
+            }],
+        }],
+    }
+    res = fact_check_rendered_survey.invoke({
+        "markdown": md,
+        "survey_json": survey,
+    })
+    assert res["input_mode"] == "survey_json"
+    assert res["items"][0]["citation_id"] == "2401.12345"
+
+
 def test_use_extracted_claims_false_skips_anchor(isolated_corpus, fake_paper):
     """Explicitly disabling extracted claims keeps the BM25-only baseline path."""
     paper = dict(fake_paper)

@@ -185,7 +185,19 @@ footnote 格式约束：
 
 ```
 cite_result = verify_citations(read('stage2_literature_surveyor.md'))
-fact_result = fact_check_rendered_survey(read('stage2_literature_surveyor.md'), use_llm=True)
+
+# 推荐：用 stage2.json 走 fast path，跳过 markdown 解析的不确定性，且
+# Finding.claim_ids 会被直接当 anchor（更确定，不靠 token-overlap 猜）
+fact_result = fact_check_rendered_survey(
+    survey_json=read_json('stage2.json'),
+    use_llm=True,
+)
+
+# 退路：仅有 markdown（外部 review 场景）
+# fact_result = fact_check_rendered_survey(
+#     markdown=read('stage2_literature_surveyor.md'),
+#     use_llm=True,
+# )
 ```
 
 如果 `cite_result.unverified_count > 0`：

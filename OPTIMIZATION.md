@@ -189,10 +189,13 @@
 - [x] `_select_context` 参数化 `max_chars` + `max_sentences`（兼容原 6K/12s 默认）
 - [x] 5 个新单测（retry-flips / retry-kept-original / 高置信不 retry / supported 不 retry / flag 关闭不 retry）—— 都 mock LLM judge 无外部依赖
 
-### E6. 接 stage2.json
-- [ ] 新参 `survey_json: dict = None`
-- [ ] 优先按 `findings[i].claim_ids` 直接拿 claim evidence_quote，跳过 markdown 句子解析
-- [ ] markdown 入口保留作为兜底
+### E6. 接 stage2.json —— ✅ 完成
+- [x] 新参 `survey_json: dict = None`；与 `markdown` 互斥（survey_json 优先）
+- [x] `attributions_from_survey_json` helper：每个 Finding → 1 attribution，cite_text 解析出 (kind, id)
+- [x] `preferred_claim_id` 通过 `_check_claim_against_paper` 直接定位 claim_id，**跳过 token-overlap 匹配**
+- [x] 输出加 `input_mode ∈ {"survey_json", "markdown", "empty"}`，调用方可知道走的哪条路
+- [x] markdown 入口完全保留作为兜底，老 caller 一行不动
+- [x] 6 个新测试覆盖 survey_json 主路径 / preferred claim 优先 / 无 preferred 时 fallback / 双 input survey 优先 / 空 findings / 仅 markdown
 
 ---
 
@@ -220,7 +223,7 @@
 - [x] `skills/systematic-review/SKILL.md` 新增 **step 7.5**：每条 finding 写进 stage2.json 前必跑 `claim_search` 找 backing claim，记录 `claim_ids`；硬约束 `claim_ids` 非空
 - [x] Step 8 JSON 示例改为带 `claim_ids` 的完整 Finding
 - [x] Step 9 加 `matched_claim_id` ↔ `claim_ids` 交叉校验流程（fact_check 实际命中的 claim 应在 finding 声明的 claim_ids 里）
-- [ ] Step 9 fact_check 调用改传 `survey_json=...`（E6 fast path）—— 留给 E6 一起做
+- [x] Step 9 fact_check 调用可改传 `survey_json=...`（E6 fast path）—— 工具已支持；SKILL.md 待补示例
 
 ### G2. Markdown 渲染
 - [x] finding 后 evidence footnote 强约定：`> evidence: "..." — Section X (arxiv:XXXX#claim-N)`

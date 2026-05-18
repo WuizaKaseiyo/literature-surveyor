@@ -245,6 +245,62 @@ def _split_sentences(paragraph: str) -> list[str]:
     return out
 
 
+def attributions_from_survey_json(survey_json: dict) -> list[dict[str, Any]]:
+    """Build attributions directly from a LiteratureSurveySchema-shaped dict.
+
+    Each finding becomes ONE attribution (no sentence splitting / backward
+    attribution / footnote handling — those are markdown-parsing concerns).
+
+    finding.cites[*].cite_text is parsed to extract (kind, id) so the same
+    paper-lookup logic works for both entry points.
+
+    finding.claim_ids are passed through as `preferred_claim_ids` so the
+    judge can use the talent's pre-declared anchors instead of re-running
+    token-overlap matching.
+    """
+    out: list[dict[str, Any]] = []
+    cite_id_pat = re.compile(r"(arxiv|doi|s2):([^,\]\s]+)", re.IGNORECASE)
+    for i, f in enumerate(survey_json.get("findings", [])):
+        if not isinstance(f, dict):
+            continue
+        text = (f.get("text") or "").strip()
+        if not text:
+            continue
+        cites_out: list[dict[str, Any]] = []
+        for c in f.get("cites", []) or []:
+            if not isinstance(c, dict):
+                continue
+            cite_text = c.get("cite_text", "") or ""
+            paper_id = c.get("paper_id", "") or ""
+            m = cite_id_pat.search(cite_text)
+            if m:
+                kind = m.group(1).lower()
+                cid = m.group(2).strip().rstrip(".,;:)")
+            elif paper_id:
+                # Heuristic: if paper_id looks like arxiv (e.g., 2401.12345 or
+                # cs.CL/0123456), assume arxiv. Otherwise default to arxiv too;
+                # verify_citations / paper lookup will surface mismatches.
+                kind = "arxiv"
+                cid = paper_id
+            else:
+                continue
+            cites_out.append({
+                "raw": f"[{cite_text or paper_id}]",
+                "kind": kind,
+                "id": cid,
+            })
+        if not cites_out:
+            continue
+        out.append({
+            "id": f"finding-{i + 1:04d}",
+            "claim_text": text,
+            "sentence_with_cites": text,
+            "citations": cites_out,
+            "preferred_claim_ids": list(f.get("claim_ids") or []),
+        })
+    return out
+
+
 def parse_attributions(markdown: str) -> list[dict[str, Any]]:
     """Parse Markdown into sentence-level claim/citation pairs.
 
@@ -636,7 +692,12 @@ def _check_claim_against_paper(
     use_llm: bool,
     use_extracted_claims: bool = True,
     expand_on_low_confidence: bool = True,
+    preferred_claim_id: str = "",
 ) -> dict[str, Any]:
+    """When called from the survey_json fast path, `preferred_claim_id` is the
+    claim id the talent declared in Finding.claim_ids; we use it as the anchor
+    directly, skipping token-overlap matching. Empty string = fall back to the
+    matcher (markdown path or no preferred anchor)."""
     if paper is None:
         return {
             "verdict": "source_not_in_corpus",
@@ -655,7 +716,13 @@ def _check_claim_against_paper(
     matched_claim: dict | None = None
     if use_extracted_claims:
         claims = _load_claims_for_paper(paper.get("id", ""))
-        matched_claim, _match_score = _match_claim_to_sentence(claim, claims)
+        if preferred_claim_id:
+            for c in claims:
+                if c.get("id") == preferred_claim_id:
+                    matched_claim = c
+                    break
+        if matched_claim is None:
+            matched_claim, _match_score = _match_claim_to_sentence(claim, claims)
 
     anchor_block = _build_anchor_block(matched_claim)
     if anchor_block:
@@ -818,21 +885,26 @@ def _summary(items: list[dict], per_attribution: list[dict]) -> dict[str, Any]:
 
 @tool
 def fact_check_rendered_survey(
-    markdown: str,
+    markdown: str = "",
     use_llm: bool = False,
     judge_model: str = "openai/gpt-4o-mini",
     max_checks: int = 200,
     use_extracted_claims: bool = True,
     expand_on_low_confidence: bool = True,
+    survey_json: dict | None = None,
 ) -> dict[str, Any]:
-    """Fact-check final Markdown claims against their cited corpus papers.
+    """Fact-check final survey claims against their cited corpus papers.
 
-    Run this after verify_citations on `stage2_literature_surveyor.md`.
-    Unlike verify_citations, this checks whether a citation supports the
-    specific sentence it is attached to.
+    Two entry points (use one):
+      - `markdown`: legacy. Sentence-level parsing of the rendered Stage 2
+        markdown. Handles backward attribution and code-block skipping.
+      - `survey_json`: E6 fast path. A `LiteratureSurveySchema`-shaped dict.
+        Each `findings[i]` becomes one attribution; `claim_ids[*]` are honored
+        as pre-declared anchors (skips token-overlap matching against
+        claims.jsonl). More deterministic, no parser edge cases.
 
     Args:
-        markdown: Final rendered survey Markdown.
+        markdown: Final rendered survey Markdown. Ignored when survey_json is supplied.
         use_llm: If True, use an available OMC/OpenAI-compatible LLM judge;
             otherwise use a conservative deterministic heuristic.
         judge_model: LLM judge model for use_llm=True.
@@ -847,39 +919,56 @@ def fact_check_rendered_survey(
             retry verdict is stricter (more concerning), it replaces the first;
             otherwise the first is kept. Each item exposes `expanded_retry`
             ∈ {"", "took_stricter", "kept_original", "retry_failed"}.
+        survey_json: E6 fast path input. Mutually preferred over markdown when both supplied.
 
     Returns:
         {
-          "items": [...],   # each item gains matched_claim_id, matched_claim_quote, expanded_retry
+          "items": [...],
           "supported_count": N,
           "unsupported_count": M,
           "blocking_count": K,
           "parsed_attributions": A,
-          "total_checked": C
+          "total_checked": C,
+          "input_mode": "survey_json" | "markdown" | "empty"
         }
     """
-    if not markdown:
+    if survey_json:
+        attributions = attributions_from_survey_json(survey_json)
+        input_mode = "survey_json"
+    elif markdown:
+        attributions = parse_attributions(markdown)
+        input_mode = "markdown"
+    else:
         empty = _summary([], [])
         return {
             **empty,
             "items": [],
             "per_attribution": [],
             "parsed_attributions": 0,
-            "verification_method": "final markdown attribution fact check",
+            "input_mode": "empty",
+            "verification_method": "final attribution fact check",
         }
 
     papers = _load_papers()
     lookup = _paper_lookup(papers)
-    attributions = parse_attributions(markdown)
 
     items: list[dict[str, Any]] = []
     for attr in attributions:
+        preferred_ids = attr.get("preferred_claim_ids") or []
         for cite in attr["citations"]:
             if len(items) >= max(1, min(int(max_checks), 1000)):
                 break
             kind = cite["kind"].lower()
             cite_id = _normalize_cite_id(cite["id"])
             paper = lookup.get((kind, cite_id))
+            # E6: pick the preferred_claim_id that targets THIS cite's paper.
+            preferred_cid = ""
+            if paper and preferred_ids:
+                pid = paper.get("id", "")
+                for cid in preferred_ids:
+                    if isinstance(cid, str) and cid.startswith(f"{pid}#"):
+                        preferred_cid = cid
+                        break
             result = _check_claim_against_paper(
                 attr["claim_text"],
                 paper,
@@ -887,6 +976,7 @@ def fact_check_rendered_survey(
                 use_llm,
                 use_extracted_claims=use_extracted_claims,
                 expand_on_low_confidence=expand_on_low_confidence,
+                preferred_claim_id=preferred_cid,
             )
             items.append(
                 {
@@ -919,5 +1009,6 @@ def fact_check_rendered_survey(
         "parsed_attributions": len(attributions),
         "corpus_size": len(papers),
         "checked_at": time.time(),
-        "verification_method": "final markdown attribution fact check",
+        "input_mode": input_mode,
+        "verification_method": f"final attribution fact check ({input_mode})",
     }
