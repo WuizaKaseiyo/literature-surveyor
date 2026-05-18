@@ -113,6 +113,100 @@ def test_fact_check_catches_numeric_mismatch(isolated_corpus, fake_paper):
     assert "50" in res["items"][0]["explanation"]
 
 
+# ---------------------------------------------------------------------------
+# E2 — unit-aware number matching in heuristic judge
+# ---------------------------------------------------------------------------
+
+
+def test_e2_tolerance_accepts_near_value(isolated_corpus, fake_paper):
+    """Claim "31% reduction" should NOT be flagged when source says "30%"
+    — within the 5% relative tolerance band."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "Pruning attention heads reduces latency by 31% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    item = res["items"][0]
+    assert item["verdict"] != "unsupported", (
+        f"31% should be within tolerance of 30%; got {item['verdict']}"
+    )
+
+
+def test_e2_recognizes_percent_word_form(isolated_corpus, fake_paper):
+    """`30 percent` in source should be canonicalized as 30% and match claim's
+    `30%` — heuristic shouldn't be defeated by word vs symbol."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning reduces latency by 30 percent in language models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    item = res["items"][0]
+    assert item["verdict"] != "unsupported"
+
+
+def test_e2_unit_mismatch_still_caught(isolated_corpus, fake_paper):
+    """Different units mean different things — 1M params ≠ 1B params even
+    though the digit "1" is the same."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "We trained 1M-parameter models on synthetic data with attention heads."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "We trained 1B-parameter models on synthetic data with attention heads "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    item = res["items"][0]
+    # Should not be supported — 1B vs 1M is a 1000× difference, definitely outside tolerance
+    assert item["verdict"] in {"unsupported", "partially_supported"}, item
+
+
+def test_e2_outside_tolerance_still_unsupported(isolated_corpus, fake_paper):
+    """Sanity-preserve: 50% claim against 30% source is still wrong."""
+    paper = dict(fake_paper)
+    paper["abstract"] = (
+        "Pruning attention heads leads to 30% latency reduction in models below 7B."
+    )
+    corpus_add_paper.invoke({"paper": paper})
+    md = (
+        "Pruning attention heads reduces latency by 50% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+    res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})
+    assert res["unsupported_count"] == 1
+    assert "50" in res["items"][0]["explanation"]
+
+
+def test_e2_extract_helper_unit_table():
+    """Direct test of _extract_numbers_with_unit canonicalization."""
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _extract_numbers_with_unit,
+    )
+    cases = {
+        "30%": [(30.0, "%")],
+        "30 percent reduction": [(30.0, "%")],
+        "30 pct": [(30.0, "%")],
+        "1.5B params": [(1.5, "B")],
+        "7B and 13B": [(7.0, "B"), (13.0, "B")],
+        "the rate was 30": [(30.0, "")],
+        "no numbers here": [],
+    }
+    for text, expected in cases.items():
+        got = _extract_numbers_with_unit(text)
+        assert got == expected, f"{text!r} → {got}, want {expected}"
+
+
 def test_fact_check_requires_cited_paper_in_corpus(isolated_corpus):
     md = "A real-looking claim [Smith et al. 2024, arxiv:2401.12345]."
     res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": False})

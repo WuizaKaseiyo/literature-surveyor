@@ -30,6 +30,19 @@ FENCED_CODE_PATTERN = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_PATTERN = re.compile(r"`[^`]*`")
 SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:\d+(?:\.\d+)?%?|\d+(?:\.\d+)?[KMBTkmbt]?)")
+# E2: number-with-unit pattern. Captures the digit string + the unit slot in one shot.
+# Unit alternatives (in priority order):
+#   \s*%                          → percent sign
+#   \s+(?:percent|percentage|pct) → percent word form (must be preceded by space)
+#   [KMBTkmbt]\b                  → scale suffix (Big-K/M/B/T) with word boundary
+#   ε                             → bare number, no unit
+_NUM_WITH_UNIT_PAT = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(-?\d+(?:\.\d+)?)"
+    r"(\s*%|\s+(?:percent|percentage|pct)\b|[KMBTkmbt]\b|)",
+    re.IGNORECASE,
+)
+_NUMBER_TOLERANCE = 0.05  # relative tolerance for numeric matching
 MAX_SOURCE_CHARS = 50000
 MAX_CONTEXT_CHARS = 6000
 
@@ -286,11 +299,86 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _numbers(text: str) -> set[str]:
+    """Legacy bag-of-numbers extractor. Retained for callers that want a coarse
+    set of stringified numbers; the heuristic now uses
+    _extract_numbers_with_unit + _numbers_match for unit-aware tolerance.
+    """
     out = set()
     for n in NUMBER_PATTERN.findall(text or ""):
         out.add(n.lower())
         out.add(n.lower().rstrip("%"))
     return out
+
+
+def _extract_numbers_with_unit(text: str) -> list[tuple[float, str]]:
+    """Return [(value, unit)] for each number in `text`.
+
+    Unit canonical form: "%" / "K" / "M" / "B" / "T" / "" (no unit).
+    Word forms ("30 percent", "30 pct") normalize to "%". Sign is preserved
+    when captured (limited: only when not glued to a preceding alphanumeric).
+
+    Examples:
+        "30%"           → [(30.0, "%")]
+        "30 percent"    → [(30.0, "%")]
+        "1.5B params"   → [(1.5, "B")]
+        "improved by 13" → [(13.0, "")]
+    """
+    out: list[tuple[float, str]] = []
+    for m in _NUM_WITH_UNIT_PAT.finditer(text or ""):
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            continue
+        u_raw = (m.group(2) or "").strip().lower()
+        if u_raw == "%":
+            unit = "%"
+        elif u_raw in ("percent", "percentage", "pct"):
+            unit = "%"
+        elif u_raw in ("k", "m", "b", "t"):
+            unit = u_raw.upper()
+        else:
+            unit = ""
+        out.append((v, unit))
+    return out
+
+
+def _fmt_num(v: float, u: str) -> str:
+    return f"{int(v) if v == int(v) else v}{u}"
+
+
+def _numbers_match(
+    claim_text: str, source_text: str, rel_tol: float = _NUMBER_TOLERANCE
+) -> tuple[bool, list[str]]:
+    """For each (value, unit) in claim, look for any source (v', u') with the
+    SAME unit and `|v - v'| / max(|v|, |v'|) <= rel_tol`. Returns
+    (all_matched, missing_pretty_strings).
+
+    Same-unit constraint intentional: 30% ≢ 0.30 without context, even though
+    they're numerically equivalent. Cross-unit equivalence is a downstream LLM
+    judge's job, not the cheap heuristic's.
+    """
+    claim_nums = _extract_numbers_with_unit(claim_text)
+    if not claim_nums:
+        return True, []
+    source_nums = _extract_numbers_with_unit(source_text)
+    missing: list[str] = []
+    for cv, cu in claim_nums:
+        ok = False
+        for sv, su in source_nums:
+            if cu != su:
+                continue
+            denom = max(abs(cv), abs(sv))
+            if denom == 0:
+                ok = (cv == sv)
+                if ok:
+                    break
+                continue
+            if abs(cv - sv) / denom <= rel_tol:
+                ok = True
+                break
+        if not ok:
+            missing.append(_fmt_num(cv, cu))
+    return len(missing) == 0, missing
 
 
 def _source_text(paper: dict) -> str:
@@ -371,18 +459,17 @@ def _heuristic_judge(claim: str, source: str) -> dict[str, Any]:
             "judge": "heuristic",
         }
 
-    claim_numbers = _numbers(claim)
-    source_numbers = _numbers(context)
-    missing_numbers = sorted(n for n in claim_numbers if n not in source_numbers)
-
-    if missing_numbers:
+    matched, missing_numbers = _numbers_match(claim, context)
+    if not matched:
         return {
             "verdict": "unsupported",
             "confidence": 0.55,
             "evidence_quote": top_sentences[0],
             "explanation": (
                 "The cited source is topically related, but the selected evidence "
-                f"does not contain the claim's numeric value(s): {', '.join(missing_numbers[:5])}."
+                f"does not contain the claim's numeric value(s) within "
+                f"{int(_NUMBER_TOLERANCE * 100)}% tolerance: "
+                f"{', '.join(missing_numbers[:5])}."
             ),
             "judge": "heuristic",
         }

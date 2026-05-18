@@ -162,10 +162,13 @@
   - elapsed 几乎相同（29.0s vs 28.9s），anchor hit 72%（13/18）
   - 顺带修复 `_llm_judge` 对字符串 confidence（DS-V3 返回 `"high"`）crash 的 bug，加 `_parse_confidence`
 
-### E2. 数字匹配放宽
-- [ ] 归一：`30%` ≡ `0.30` ≡ `30 percent` ≡ `30.0%`
-- [ ] 容差：`abs(a-b)/max(|a|,|b|) <= 0.05` 视为命中
-- [ ] 差值匹配：`_extract_diffs(text)` 抽相邻百分比差值，支持 "reduced by 13pp" 对应 `42% → 29%`
+### E2. 数字匹配放宽 —— ✅ 完成（差值匹配延后）
+- [x] 单位归一：`%` ≡ `percent` ≡ `pct`；`K/M/B/T` 大小写；保留有符号
+- [x] 容差：`abs(a-b)/max(|a|,|b|) <= 0.05` 同单位内匹配
+- [ ] ~~跨单位等价（30% ≡ 0.30）~~ 故意不做：lossy + 上下文相关，留给 LLM judge
+- [ ] 差值匹配（"reduced by 13pp" ≡ `42% → 29%`）—— 延后，复杂度高、可用 LLM judge 兜住
+- [x] `_extract_numbers_with_unit` + `_numbers_match` 新 helper；`_heuristic_judge` 切换；老 `_numbers` 保留为 deprecated 但不删
+- [x] 5 个新测试（容差命中 / percent 词形 / 单位错配 / 容差外仍 fail / extract helper 单位表）
 
 ### E3. 多 cite 聚合 —— ✅ 完成
 - [x] 按 `attribution_id` 聚合 cite，最终 verdict = 按 supported > partial > contradicted > unsupported > ... rank 取 best
