@@ -118,17 +118,39 @@ def _tokenize(text: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_value(v: Any) -> str:
-    return re.sub(r"\s+", "", str(v or "").lower())
+# Tokenize a dim value into alphanumeric runs (lowercased). Used by
+# _share_setting to compare values by shared atomic tokens rather than naive
+# bidirectional substring — substring matched "7B" inside "L17B" and
+# "model_7b" inside "7b-something-irrelevant", causing false-positive
+# candidate pairs.
+_DIM_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
+
+
+def _value_tokens(v: Any) -> set[str]:
+    """Tokens of a dim value + the whitespace-smashed full form.
+
+    The smashed form lets "TruthfulQA" match "truthful qa" (talents may write
+    a multi-word dataset name with or without a space). Pure tokens would miss
+    this; pure substring would over-match ("L1" ⊂ "L17B"). This is the middle.
+    """
+    s = str(v or "").lower()
+    tokens = {m for m in _DIM_TOKEN_RE.findall(s)}
+    smashed = re.sub(r"\s+", "", s)
+    smashed = re.sub(r"[^a-zA-Z0-9]+", "", smashed)
+    if smashed and len(smashed) >= 3:  # avoid trivial cross-matches
+        tokens.add(smashed)
+    return tokens
 
 
 def _share_setting(dims_a: dict | None, dims_b: dict | None) -> dict | None:
-    """Return a dict of shared {key: (val_a, val_b)} for keys both claims fill
-    with overlapping values, or None if no setting overlap.
+    """Return shared {key: (val_a, val_b)} for keys both claims fill with at
+    least one shared alphanumeric token; None if no overlap.
 
-    Overlap rule: bidirectional substring after lowercasing + whitespace strip.
-    "7B" matches "7B-13B"; "MMLU" matches "MMLU and BBH"; "TruthfulQA" doesn't
-    match "MMLU".
+    Token-set intersection (M6 fix). Examples:
+        "7B" vs "7B-13B"     → tokens {"7b"} ∩ {"7b","13b"} ≠ ∅ → match
+        "MMLU" vs "MMLU+BBH" → {"mmlu"} ∩ {"mmlu","bbh"}  ≠ ∅ → match
+        "L1"  vs "L17B"      → {"l1"} ∩ {"l17b"}          = ∅ → NO match
+        "7B"  vs "L17B"      → {"7b"} ∩ {"l17b"}          = ∅ → NO match
     """
     dims_a = dims_a or {}
     dims_b = dims_b or {}
@@ -139,10 +161,10 @@ def _share_setting(dims_a: dict | None, dims_b: dict | None) -> dict | None:
         return None
     out: dict = {}
     for k in shared_keys:
-        na, nb = _normalize_value(dims_a[k]), _normalize_value(dims_b[k])
-        if not na or not nb:
+        ta, tb = _value_tokens(dims_a[k]), _value_tokens(dims_b[k])
+        if not ta or not tb:
             continue
-        if na in nb or nb in na:
+        if ta & tb:
             out[k] = (dims_a[k], dims_b[k])
     return out or None
 
@@ -163,8 +185,12 @@ def _candidate_pairs(claims: list[dict], min_jaccard: float) -> list[dict]:
     Filtering chain (cheapest → most expensive):
       1. Different paper_id
       2. Neither is pure conjecture (per conflict-detection SKILL.md)
-      3. applies_to_dims share at least one key with overlapping value
+      3. applies_to_dims share at least one alphanumeric token
       4. claim_text token Jaccard >= min_jaccard
+
+    M9 fix: collect ALL candidates, sort by topic_overlap, then cap to
+    MAX_CANDIDATE_PAIRS. The previous early-break dropped high-scoring pairs
+    that came later in combinations() iteration order.
     """
     out: list[dict] = []
     for a, b in combinations(claims, 2):
@@ -181,11 +207,9 @@ def _candidate_pairs(claims: list[dict], min_jaccard: float) -> list[dict]:
         if topic < min_jaccard:
             continue
         out.append({"a": a, "b": b, "shared_setting": shared, "topic_overlap": topic})
-        if len(out) >= MAX_CANDIDATE_PAIRS:
-            break
-    # Rank by topic overlap so the LLM judge sees the most-likely-real pairs first
+    # Sort first, then cap — keeps the highest-overlap pairs even on large corpora.
     out.sort(key=lambda x: x["topic_overlap"], reverse=True)
-    return out
+    return out[:MAX_CANDIDATE_PAIRS]
 
 
 # ---------------------------------------------------------------------------

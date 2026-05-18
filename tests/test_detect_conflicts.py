@@ -41,14 +41,44 @@ def _c(cid, pid, text, claim_type="factual", dims=None):
 # ---------------------------------------------------------------------------
 
 
-def test_share_setting_substring_match():
+def test_share_setting_token_overlap():
+    """Token-set intersection (M6 fix): "7B" shares a token with "7B-13B"."""
     out = _share_setting(
         {"model_size": "7B-13B", "dataset": "MMLU"},
         {"model_size": "7B", "dataset": "BBH"},
     )
     assert out is not None
-    assert "model_size" in out          # 7B ⊂ 7B-13B
-    assert "dataset" not in out          # MMLU ≠ BBH
+    assert "model_size" in out
+    assert "dataset" not in out
+
+
+def test_share_setting_rejects_substring_false_positive():
+    """M6 regression guard: "L1" must NOT match "L17B" (substring would have);
+    token sets give {"l1"} vs {"l17b"} which don't intersect."""
+    out = _share_setting(
+        {"model_size": "L1"},
+        {"model_size": "L17B"},
+    )
+    assert out is None, "L1 must not match L17B — distinct tokens"
+
+
+def test_share_setting_rejects_digit_run_false_positive():
+    """M6 regression guard: "7B" must NOT match "L17B" — different tokens
+    even though digit substring "7" appears in both."""
+    out = _share_setting(
+        {"model_size": "7B"},
+        {"model_size": "L17B"},
+    )
+    assert out is None
+
+
+def test_share_setting_multi_value_handled():
+    """Comma-separated dim values tokenize into multiple atoms."""
+    out = _share_setting(
+        {"model_size": "7B, 13B, 70B"},
+        {"model_size": "70B"},
+    )
+    assert out is not None and "model_size" in out
 
 
 def test_share_setting_no_keys_overlap():
@@ -130,6 +160,43 @@ def test_candidate_finds_overlapping_setting_pair():
     assert pairs[0]["b"]["paper_id"] == "p2"
     assert "model_size" in pairs[0]["shared_setting"]
     assert "dataset" in pairs[0]["shared_setting"]
+
+
+def test_candidate_pairs_sort_before_cap_keeps_high_score_late():
+    """M9 regression guard: a high-overlap pair appearing LATE in iteration
+    order must not be dropped by the cap. Old code did `if len >= CAP: break`
+    inside the loop; correct code sorts then caps."""
+    from tools.detect_conflicts.detect_conflicts import MAX_CANDIDATE_PAIRS
+    # Generate MAX_CANDIDATE_PAIRS + 5 weak candidate pairs first, then one
+    # very high-overlap pair last. The latter must survive the cap.
+    weak_claims = []
+    for i in range(MAX_CANDIDATE_PAIRS + 5):
+        weak_claims.append(_c(
+            f"weak-p{i}#c1", f"weak-p{i}",
+            f"Token unique{i} thing happens here with attention models",
+            dims={"model_size": "7B"},
+        ))
+    # Two STRONG-overlap claims at the tail
+    strong_a = _c(
+        "strong-a#c1", "strong-a",
+        "DPO matches PPO on summarization quality across runs reliably consistently",
+        dims={"model_size": "7B"},
+    )
+    strong_b = _c(
+        "strong-b#c1", "strong-b",
+        "DPO matches PPO on summarization quality across runs reliably consistently",
+        dims={"model_size": "7B"},
+    )
+    claims = weak_claims + [strong_a, strong_b]
+
+    pairs = _candidate_pairs(claims, min_jaccard=0.0)
+    assert len(pairs) <= MAX_CANDIDATE_PAIRS, "must respect the cap"
+    # The strong pair MUST be present despite being added last in the loop
+    strong_present = any(
+        {pair["a"]["paper_id"], pair["b"]["paper_id"]} == {"strong-a", "strong-b"}
+        for pair in pairs
+    )
+    assert strong_present, "high-overlap tail pair dropped by early break (M9 regression)"
 
 
 def test_candidate_topic_threshold_drops_unrelated():

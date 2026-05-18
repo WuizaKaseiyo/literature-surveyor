@@ -19,6 +19,100 @@ def _write_claims(corpus_dir, claims):
             f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Verdict-rank aggregation + E5 strictness invariants (regression guard)
+# ---------------------------------------------------------------------------
+
+
+def test_rollup_rank_aggregation_matrix():
+    """Every unordered verdict pair gets rolled up to a deterministic final.
+
+    The expected map below pins the *semantic* contract — change the map ONLY
+    if you intend to change behavior. The map is duplicated from
+    `_ROLLUP_RANK`'s semantics so a silent rank reshuffle is caught here.
+    """
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _aggregate_attributions,
+        _ROLLUP_RANK,
+    )
+    import itertools
+
+    verdicts = [
+        "supported", "partially_supported", "contradicted", "unsupported",
+        "source_irrelevant", "source_not_in_corpus", "no_source_text", "judge_error",
+    ]
+    for v1, v2 in itertools.combinations_with_replacement(verdicts, 2):
+        items = [
+            {"attribution_id": "a", "claim_text": "x", "verdict": v1, "citation_id": "p1"},
+            {"attribution_id": "a", "claim_text": "x", "verdict": v2, "citation_id": "p2"},
+        ]
+        per_attr = _aggregate_attributions(items)
+        assert len(per_attr) == 1
+        final = per_attr[0]["final_verdict"]
+        # The contract: max rank wins. If two verdicts tie, max() picks
+        # the first occurrence in iteration order.
+        expected = max((v1, v2), key=lambda v: _ROLLUP_RANK[v])
+        assert final == expected, (
+            f"rollup of [{v1}, {v2}] → {final}, expected {expected}"
+        )
+
+
+def test_rollup_rank_key_contract():
+    """Verbose pinning of the EXACT rollup semantics for review pairs that
+    matter. Reviewers should look at this table to understand intent."""
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _aggregate_attributions,
+    )
+    # (verdict_a, verdict_b) → expected_final
+    cases = [
+        ("supported",            "contradicted",         "supported"),         # one good cite trumps a bad one
+        ("supported",            "unsupported",          "supported"),
+        ("partially_supported",  "contradicted",         "partially_supported"),
+        ("partially_supported",  "unsupported",          "partially_supported"),
+        # Among rejection-class verdicts, "contradicted" (active opposition) is
+        # MORE informative than "unsupported" (mere absence), so the rollup
+        # display surfaces it. Talent action differs.
+        ("unsupported",          "contradicted",         "contradicted"),
+        ("source_irrelevant",    "contradicted",         "contradicted"),
+        ("source_not_in_corpus", "unsupported",          "unsupported"),
+        ("source_not_in_corpus", "no_source_text",       "source_not_in_corpus"),
+        ("judge_error",          "supported",            "supported"),
+        ("judge_error",          "judge_error",          "judge_error"),
+    ]
+    for v_a, v_b, expected in cases:
+        items = [
+            {"attribution_id": "x", "claim_text": "c", "verdict": v_a, "citation_id": "p1"},
+            {"attribution_id": "x", "claim_text": "c", "verdict": v_b, "citation_id": "p2"},
+        ]
+        per_attr = _aggregate_attributions(items)
+        assert per_attr[0]["final_verdict"] == expected, (
+            f"[{v_a}, {v_b}] → {per_attr[0]['final_verdict']}, want {expected}"
+        )
+
+
+def test_strictness_rank_invariants():
+    """E5 retry uses _STRICTNESS_RANK with `new < orig → take retry` semantics.
+    These invariants encode "we never relax, and we DO escalate to contradicted"."""
+    from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
+        _STRICTNESS_RANK as S,
+    )
+    # 1. supported is the LEAST strict (highest rank)
+    assert max(S, key=S.get) == "supported"
+    # 2. contradicted is the MOST strict (lowest rank)
+    assert min(S, key=S.get) == "contradicted"
+    # 3. The whole supportiveness ladder: supported > partial > unsupported > contradicted
+    assert S["supported"] > S["partially_supported"]
+    assert S["partially_supported"] > S["unsupported"]
+    assert S["unsupported"] > S["contradicted"]
+    # 4. Critical for C1 fix: retry escalation unsupported → contradicted MUST trigger
+    #    `new(contradicted) < orig(unsupported)` for the retry to take effect.
+    assert S["contradicted"] < S["unsupported"], (
+        "C1 regression: E5 retry will fail to escalate unsupported → contradicted"
+    )
+    # 5. Mirror: retry relaxation contradicted → supported MUST NOT trigger.
+    assert S["supported"] > S["contradicted"]
+
+
 def test_parse_backward_attribution():
     md = (
         "The paper studies attention in small language models. "

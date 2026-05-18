@@ -500,7 +500,7 @@ def _load_existing_claims_for(paper_id: str) -> list[dict]:
 def extract_claims(
     paper_id: str,
     model: str = DEFAULT_EXTRACTION_MODEL,
-    version: str = "v1",
+    version: str = "v2",
     force: bool = False,
 ) -> dict[str, Any]:
     """Extract 5-15 structured claims from a paper in the corpus and persist them.
@@ -508,10 +508,12 @@ def extract_claims(
     Args:
         paper_id: ID of paper already added via corpus_add_paper.
         model: LLM model to use. Default openai/gpt-4o-mini (cheap structured extraction).
-        version: Extraction strategy version. "v1" (current) = single-shot on first
-            30K chars of full text. "v2" = section-aware split + per-section extraction
-            + evidence_quote ground-truth check + structured applies_to_dims.
-            See OPTIMIZATION.md section C for v2 design.
+        version: Extraction strategy. Default **"v2"** = section-aware split +
+            per-section extraction + evidence_quote ground-truth check +
+            structured applies_to_dims (matches release-gate validation).
+            "v1" is the legacy single-shot 30K-char-truncated path, retained
+            for backward compat — emits a deprecation warning when used.
+            See docs/internal/OPTIMIZATION.md section C for v2 design.
         force: If False (default), short-circuit when claims for this paper_id
             already exist (saves LLM calls + avoids duplicate rows). In A2
             layered mode this is what enables cross-project claim reuse —
@@ -620,6 +622,12 @@ def extract_claims(
             "warnings": warnings,
         }
 
+    # v1 is the legacy path. Default flipped to v2 in this release; v1 still
+    # works but is deprecated. Loud warning in the return payload.
+    v1_deprecation = (
+        "v1 is the legacy 30K-truncated single-shot path; default is now v2. "
+        "Pass version='v2' explicitly for section-aware extraction + quote verification."
+    )
     text = paper.get("full_text_md") or paper.get("abstract") or ""
     if len(text) < 200:
         return {
@@ -638,7 +646,7 @@ def extract_claims(
         }
 
     validated: list[dict] = []
-    warnings: list[str] = []
+    warnings: list[str] = [f"DEPRECATED: {v1_deprecation}"]
     if v1_parse_mode.startswith("salvaged_"):
         warnings.append(
             f"v1 LLM response malformed; rescued via partial parse ({v1_parse_mode})"
