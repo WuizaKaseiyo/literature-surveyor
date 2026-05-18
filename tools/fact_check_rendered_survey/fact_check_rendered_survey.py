@@ -45,6 +45,9 @@ _NUM_WITH_UNIT_PAT = re.compile(
 _NUMBER_TOLERANCE = 0.05  # relative tolerance for numeric matching
 MAX_SOURCE_CHARS = 50000
 MAX_CONTEXT_CHARS = 6000
+EXPANDED_CONTEXT_CHARS = 12000          # E5: borderline-retry budget
+LOW_CONFIDENCE_THRESHOLD = 0.6          # E5: confidence floor below which we retry
+EXPANDABLE_VERDICTS = {"unsupported", "partially_supported"}  # only retry these
 
 VERDICTS = {
     "supported",
@@ -399,10 +402,18 @@ def _source_sentences(source: str) -> list[str]:
     return [s.strip() for s in SENTENCE_BOUNDARY_PATTERN.split(source) if s.strip()]
 
 
-def _select_context(claim: str, source: str) -> tuple[str, list[str], float]:
+def _select_context(
+    claim: str,
+    source: str,
+    max_chars: int = MAX_CONTEXT_CHARS,
+    max_sentences: int = 12,
+) -> tuple[str, list[str], float]:
+    """Pick up to `max_sentences` best-overlapping source sentences capped at
+    `max_chars`. Defaults preserve the original 6K/12-sentence baseline budget;
+    E5 expansion bumps both."""
     claim_tokens = _tokenize(claim)
     if not claim_tokens:
-        return source[:MAX_CONTEXT_CHARS], [], 0.0
+        return source[:max_chars], [], 0.0
 
     claim_counts = Counter(claim_tokens)
     claim_vocab = set(claim_counts)
@@ -424,14 +435,14 @@ def _select_context(claim: str, source: str) -> tuple[str, list[str], float]:
     ranked.sort(key=lambda x: x[0], reverse=True)
     selected: list[str] = []
     total_len = 0
-    for _, sent in ranked[:12]:
-        if total_len + len(sent) > MAX_CONTEXT_CHARS:
+    for _, sent in ranked[:max_sentences]:
+        if total_len + len(sent) > max_chars:
             break
         selected.append(sent)
         total_len += len(sent) + 1
 
     if not selected:
-        return source[:MAX_CONTEXT_CHARS], [], 0.0
+        return source[:max_chars], [], 0.0
 
     context = " ".join(selected)
     context_vocab = set(_tokenize(context))
@@ -606,12 +617,25 @@ def _llm_judge(claim: str, context: str, model: str) -> dict[str, Any] | None:
     }
 
 
+def _build_anchor_block(matched_claim: dict | None) -> str:
+    if not matched_claim or not matched_claim.get("evidence_quote"):
+        return ""
+    lines = [
+        f"Extracted claim from paper: {matched_claim.get('claim_text', '')}",
+        f"Verbatim evidence quote: {matched_claim.get('evidence_quote', '')}",
+    ]
+    if matched_claim.get("source_section"):
+        lines.append(f"Section: {matched_claim.get('source_section', '')}")
+    return "\n".join(lines)
+
+
 def _check_claim_against_paper(
     claim: str,
     paper: dict | None,
     judge_model: str,
     use_llm: bool,
     use_extracted_claims: bool = True,
+    expand_on_low_confidence: bool = True,
 ) -> dict[str, Any]:
     if paper is None:
         return {
@@ -622,6 +646,7 @@ def _check_claim_against_paper(
             "judge": "resolver",
             "matched_claim_id": "",
             "matched_claim_quote": "",
+            "expanded_retry": "",
         }
 
     source = _source_text(paper)
@@ -632,16 +657,10 @@ def _check_claim_against_paper(
         claims = _load_claims_for_paper(paper.get("id", ""))
         matched_claim, _match_score = _match_claim_to_sentence(claim, claims)
 
-    if matched_claim and matched_claim.get("evidence_quote"):
+    anchor_block = _build_anchor_block(matched_claim)
+    if anchor_block:
         # Use the pre-extracted claim as the primary anchor for the LLM judge.
         # Old BM25 context is still appended for additional grounding.
-        anchor_lines = [
-            f"Extracted claim from paper: {matched_claim.get('claim_text', '')}",
-            f"Verbatim evidence quote: {matched_claim.get('evidence_quote', '')}",
-        ]
-        if matched_claim.get("source_section"):
-            anchor_lines.append(f"Section: {matched_claim.get('source_section', '')}")
-        anchor_block = "\n".join(anchor_lines)
         judge_context = anchor_block + "\n\n---\n\nAdditional source context:\n" + context[:3000]
     else:
         judge_context = context
@@ -656,6 +675,41 @@ def _check_claim_against_paper(
     else:
         result = _heuristic_judge(claim, source)
 
+    # E5: borderline retry with expanded BM25 window. Only kicks in when the
+    # LLM judge ran AND verdict is one of the "uncertain rejection" ones AND
+    # confidence is below the threshold. Take the STRICTER verdict (more
+    # concerning) to stay conservative — talent should still investigate.
+    expanded_retry_status = ""
+    if (
+        use_llm
+        and expand_on_low_confidence
+        and str(result.get("judge", "")).startswith("llm:")
+        and result.get("verdict") in EXPANDABLE_VERDICTS
+        and float(result.get("confidence", 1.0)) < LOW_CONFIDENCE_THRESHOLD
+    ):
+        expanded_context, _, _ = _select_context(
+            claim, source, max_chars=EXPANDED_CONTEXT_CHARS, max_sentences=24
+        )
+        if anchor_block:
+            retry_context = (
+                anchor_block
+                + "\n\n---\n\nAdditional source context:\n"
+                + expanded_context
+            )
+        else:
+            retry_context = expanded_context
+        retry_judged = _llm_judge(claim, retry_context, judge_model)
+        if retry_judged:
+            orig_rank = _VERDICT_RANK.get(result.get("verdict", ""), -1)
+            new_rank = _VERDICT_RANK.get(retry_judged.get("verdict", ""), -1)
+            if new_rank < orig_rank:
+                result = retry_judged
+                expanded_retry_status = "took_stricter"
+            else:
+                expanded_retry_status = "kept_original"
+        else:
+            expanded_retry_status = "retry_failed"
+
     if not result.get("evidence_quote") and top_sentences:
         result["evidence_quote"] = top_sentences[0]
 
@@ -668,6 +722,7 @@ def _check_claim_against_paper(
     else:
         result.setdefault("matched_claim_id", "")
         result.setdefault("matched_claim_quote", "")
+    result["expanded_retry"] = expanded_retry_status
     return result
 
 
@@ -768,6 +823,7 @@ def fact_check_rendered_survey(
     judge_model: str = "openai/gpt-4o-mini",
     max_checks: int = 200,
     use_extracted_claims: bool = True,
+    expand_on_low_confidence: bool = True,
 ) -> dict[str, Any]:
     """Fact-check final Markdown claims against their cited corpus papers.
 
@@ -785,10 +841,16 @@ def fact_check_rendered_survey(
             anchor the judge to the matched pre-extracted claim's evidence_quote
             instead of (only) BM25-selecting context from raw paper text. Set
             False to compare against the BM25-only baseline.
+        expand_on_low_confidence: If True (default) and the LLM judge returned
+            "unsupported" or "partially_supported" with confidence < 0.6, retry
+            once with an expanded BM25 window (12K chars, 24 sentences). If the
+            retry verdict is stricter (more concerning), it replaces the first;
+            otherwise the first is kept. Each item exposes `expanded_retry`
+            ∈ {"", "took_stricter", "kept_original", "retry_failed"}.
 
     Returns:
         {
-          "items": [...],   # each item gains matched_claim_id, matched_claim_quote
+          "items": [...],   # each item gains matched_claim_id, matched_claim_quote, expanded_retry
           "supported_count": N,
           "unsupported_count": M,
           "blocking_count": K,
@@ -824,6 +886,7 @@ def fact_check_rendered_survey(
                 judge_model,
                 use_llm,
                 use_extracted_claims=use_extracted_claims,
+                expand_on_low_confidence=expand_on_low_confidence,
             )
             items.append(
                 {
@@ -841,6 +904,7 @@ def fact_check_rendered_survey(
                     "judge": result.get("judge", "unknown"),
                     "matched_claim_id": result.get("matched_claim_id", ""),
                     "matched_claim_quote": result.get("matched_claim_quote", ""),
+                    "expanded_retry": result.get("expanded_retry", ""),
                 }
             )
         if len(items) >= max(1, min(int(max_checks), 1000)):

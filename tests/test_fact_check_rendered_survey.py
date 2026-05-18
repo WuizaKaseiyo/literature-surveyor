@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from tools.corpus_store.corpus_store import corpus_add_paper
 from tools.fact_check_rendered_survey.fact_check_rendered_survey import (
@@ -440,6 +441,194 @@ def test_single_cite_backward_compat(isolated_corpus, fake_paper):
     assert res["blocking_count"] == res["blocking_cite_count"], (
         "no multi-cite: attribution and per-cite blocking should agree"
     )
+
+
+# ---------------------------------------------------------------------------
+# E5 — low-confidence retry with expanded context
+# ---------------------------------------------------------------------------
+
+
+def _setup_e5_paper(isolated_corpus, fake_paper) -> str:
+    """Common fixture for E5 tests: a paper + a single cite markdown.
+
+    full_text_md needs to be long enough that the 6K vs 12K BM25 windows
+    actually differ; we pad with sentences that share zero tokens with the
+    claim so BM25 ranks them at the bottom and only the expanded window picks
+    them up.
+    """
+    paper = dict(fake_paper)
+    # Many relevant sentences so the BM25 6K window fills up, and many
+    # irrelevant ones so the expansion budget materially changes the context.
+    pruning_sents = [
+        f"Pruning attention heads reduces latency by 30% in models below 7B (run {i})."
+        for i in range(60)
+    ]
+    filler_sents = [
+        f"Tokenizer vocabulary size {i} affects throughput unrelated to attention."
+        for i in range(60)
+    ]
+    paper["full_text_md"] = " ".join(pruning_sents + filler_sents)
+    corpus_add_paper.invoke({"paper": paper})
+    return (
+        "Pruning attention heads reduces latency by 30% in models below 7B "
+        "[Smith et al. 2024, arxiv:2401.12345]."
+    )
+
+
+def test_e5_low_confidence_retry_takes_stricter(isolated_corpus, fake_paper):
+    """LLM first returns partially_supported w/ low confidence → retry returns
+    contradicted (stricter). Result should flip to contradicted."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append({"context_len": len(context)})
+        if len(judge_calls) == 1:
+            return {
+                "verdict": "partially_supported",
+                "confidence": 0.4,
+                "evidence_quote": "snippet",
+                "explanation": "first pass",
+                "judge": f"llm:{model}",
+            }
+        return {
+            "verdict": "contradicted",
+            "confidence": 0.85,
+            "evidence_quote": "wider snippet",
+            "explanation": "second pass, fuller context contradicts",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 2, "should retry once on low-confidence partial"
+    assert judge_calls[1]["context_len"] > judge_calls[0]["context_len"], (
+        "retry context should be wider"
+    )
+    item = res["items"][0]
+    assert item["verdict"] == "contradicted"
+    assert item["expanded_retry"] == "took_stricter"
+
+
+def test_e5_low_confidence_retry_kept_original_when_retry_more_lenient(
+    isolated_corpus, fake_paper,
+):
+    """LLM first returns unsupported (0.4) → retry returns supported. Keep
+    original — never relax the verdict via expansion."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        if len(judge_calls) == 1:
+            return {
+                "verdict": "unsupported",
+                "confidence": 0.45,
+                "evidence_quote": "first",
+                "explanation": "first pass not finding evidence",
+                "judge": f"llm:{model}",
+            }
+        return {
+            "verdict": "supported",
+            "confidence": 0.9,
+            "evidence_quote": "second",
+            "explanation": "expanded view actually supports",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 2
+    item = res["items"][0]
+    assert item["verdict"] == "unsupported", "kept original stricter verdict"
+    assert item["expanded_retry"] == "kept_original"
+
+
+def test_e5_no_retry_when_high_confidence(isolated_corpus, fake_paper):
+    """LLM verdict confidence >= 0.6 → don't retry."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        return {
+            "verdict": "unsupported",
+            "confidence": 0.85,
+            "evidence_quote": "x",
+            "explanation": "confident",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 1, "high confidence → no retry"
+    assert res["items"][0]["expanded_retry"] == ""
+
+
+def test_e5_no_retry_when_supported(isolated_corpus, fake_paper):
+    """Even low-confidence `supported` should NOT retry — we only retry
+    rejection-leaning verdicts (we're trying to catch missed evidence)."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        return {
+            "verdict": "supported",
+            "confidence": 0.3,
+            "evidence_quote": "x",
+            "explanation": "tentative support",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({"markdown": md, "use_llm": True})
+
+    assert len(judge_calls) == 1
+    assert res["items"][0]["expanded_retry"] == ""
+
+
+def test_e5_disabled_via_flag(isolated_corpus, fake_paper):
+    """expand_on_low_confidence=False → never retry even on borderline."""
+    md = _setup_e5_paper(isolated_corpus, fake_paper)
+    judge_calls = []
+
+    def mock_judge(claim, context, model):
+        judge_calls.append(1)
+        return {
+            "verdict": "partially_supported",
+            "confidence": 0.3,
+            "evidence_quote": "x",
+            "explanation": "still partial",
+            "judge": f"llm:{model}",
+        }
+
+    with patch(
+        "tools.fact_check_rendered_survey.fact_check_rendered_survey._llm_judge",
+        side_effect=mock_judge,
+    ):
+        res = fact_check_rendered_survey.invoke({
+            "markdown": md,
+            "use_llm": True,
+            "expand_on_low_confidence": False,
+        })
+
+    assert len(judge_calls) == 1, "flag off → no retry"
 
 
 def test_use_extracted_claims_false_skips_anchor(isolated_corpus, fake_paper):

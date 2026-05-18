@@ -182,9 +182,12 @@
 - [ ] 命中 missing → arxiv/s2/openalex 搜 → pdf_extract → corpus_add_paper(global) → 重判
 - [ ] 默认 False（避免静默改 state）
 
-### E5. 扩窗重试
-- [ ] LLM verdict in {unsupported, partially_supported} 且 confidence < 0.6 时，`MAX_CONTEXT_CHARS` 临时扩到 12K 再问一次
-- [ ] 两次不一致取更严的
+### E5. 扩窗重试 —— ✅ 完成
+- [x] LLM verdict in {unsupported, partially_supported} 且 confidence < 0.6 时，BM25 窗口扩到 12K chars / 24 sentences 再问一次
+- [x] 两次取**更严**的（rank min）；retry 更宽松时**保留原始**（不放松判断）
+- [x] `@tool` 加 `expand_on_low_confidence: bool = True` 参数；items 透出 `expanded_retry ∈ {"","took_stricter","kept_original","retry_failed"}`
+- [x] `_select_context` 参数化 `max_chars` + `max_sentences`（兼容原 6K/12s 默认）
+- [x] 5 个新单测（retry-flips / retry-kept-original / 高置信不 retry / supported 不 retry / flag 关闭不 retry）—— 都 mock LLM judge 无外部依赖
 
 ### E6. 接 stage2.json
 - [ ] 新参 `survey_json: dict = None`
