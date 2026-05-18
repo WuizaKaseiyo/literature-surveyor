@@ -6,10 +6,11 @@
 
 Built for **AutoResearch's adversarial research pipeline** (Stage 2: Literature Survey). Takes a refined research question from Stage 1 and produces:
 
-- **Structured survey JSON** (Pydantic-validated) — taxonomy, findings, conflicts, open questions, gaps
-- **Human-readable markdown** — rendered from the JSON
-- **Per-project corpus** (`corpus.jsonl`) — papers + claims persisted for retry / downstream stages
-- **Citation audit** — every cite verified against arxiv / Semantic Scholar / OpenAlex, then final claims are checked against cited source text
+- **Structured survey JSON** (Pydantic-validated) — taxonomy, findings (with backing `claim_ids`), conflicts, open questions, gaps
+- **Human-readable markdown** — rendered from the JSON with optional `> evidence:` footnotes pointing to verbatim source quotes
+- **Per-project corpus + shared global pool** — same arxiv paper is fetched + claim-extracted **once across all projects** (opt-in layered mode); each project's view is a thin `refs.jsonl`
+- **Citation audit + final-text fact check** — every cite verified against arxiv / Semantic Scholar / OpenAlex; each finding then anchored to its declared extracted claim's verbatim evidence quote
+- **Cross-paper conflict detection** — `applies_to_dims` (structured scope) as the cheap join key, LLM judge as the decisive step
 
 ## Use Cases
 
@@ -34,9 +35,9 @@ Built for **AutoResearch's adversarial research pipeline** (Stage 2: Literature 
 
 ## Tools Provided
 
-17 LangChain `@tool` functions, all auto-installed on hire:
+23 LangChain `@tool` functions, all auto-installed on hire:
 
-`arxiv_search`, `semantic_scholar_search`, `openalex_search`, `parallel_multi_search`, `pdf_extract`, `corpus_store` (5 actions: add/search/status/list/get), `extract_claims`, `verify_citations`, `fact_check_rendered_survey`, `self_assess`, `run_metadata` (3 actions: start/stage_done/finalize).
+`arxiv_search`, `semantic_scholar_search`, `openalex_search`, `parallel_multi_search`, `pdf_extract`, `corpus_store` (5 actions: add/search/status/list/get), `extract_claims` (v1 + v2 + reuse short-circuit), `claim_store` (5 actions: search/list_by_paper/get/status/find_evidence), `verify_citations`, `fact_check_rendered_survey` (markdown or survey_json input + claim anchor + multi-cite rollup + low-confidence retry), `detect_conflicts`, `self_assess`, `run_metadata` (3 actions: start/stage_done/finalize).
 
 ## Skills Loaded
 
