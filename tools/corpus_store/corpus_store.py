@@ -256,8 +256,14 @@ def _load_index() -> dict:
 
 
 def _save_index(idx: dict) -> None:
+    """Atomic write — tmp + rename so a concurrent reader can never see a
+    truncated JSON file mid-write. POSIX guarantees rename atomicity within
+    the same filesystem; concurrent reads see either the old or the new
+    complete file, never a torn version."""
     path = _corpus_dir() / INDEX_FILENAME
-    path.write_text(json.dumps(idx, ensure_ascii=False))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(idx, ensure_ascii=False))
+    tmp.replace(path)
 
 
 def _update_index_for(paper: dict, idx: dict) -> None:

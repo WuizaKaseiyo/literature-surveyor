@@ -130,7 +130,13 @@ def _build_index(claims: list[dict]) -> dict:
 
 
 def _save_index(idx: dict) -> None:
-    _index_path().write_text(json.dumps(idx, ensure_ascii=False))
+    """Atomic tmp+rename write so concurrent readers never see a torn JSON.
+    Two writers racing produce identical content (deterministic from claims),
+    so last-writer-wins is correct."""
+    path = _index_path()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(idx, ensure_ascii=False))
+    tmp.replace(path)
 
 
 def _get_index_and_claims() -> tuple[dict, list[dict]]:

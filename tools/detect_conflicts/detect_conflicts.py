@@ -82,6 +82,33 @@ def _load_claims() -> list[dict]:
     return out
 
 
+def _load_year_map() -> dict[str, Any]:
+    """Build paper_id → year map for temporal-level judgement.
+
+    detect_conflicts used to look year up via `claim.get('paper', {}).get('year')`,
+    but claim records don't carry a nested paper dict — that path was dead.
+    This function reads papers.jsonl once per detect_conflicts invocation.
+    Cheap (one JSONL scan) compared to LLM-judge cost.
+    """
+    path = _corpus_dir() / "papers.jsonl"
+    if not path.exists():
+        return {}
+    out: dict[str, Any] = {}
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                p = json.loads(line)
+                pid = p.get("id")
+                if pid:
+                    out[pid] = p.get("year", "")
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
 def _tokenize(text: str) -> set[str]:
     return {t.lower() for t in _TOKEN_RE.findall(text or "") if t.lower() not in _STOP}
 
@@ -220,27 +247,50 @@ def _parse_json(raw: str) -> dict | None:
 
 
 def _llm_judge_pair(
-    claim_a: dict, claim_b: dict, shared_setting: dict, model: str
+    claim_a: dict,
+    claim_b: dict,
+    shared_setting: dict,
+    model: str,
+    year_map: dict[str, Any] | None = None,
 ) -> dict | None:
+    """LLM judge per candidate pair.
+
+    `year_map` is paper_id → year, used by the temporal-level rule. Claims
+    don't carry a nested `paper` dict, so we look year up externally; without
+    it the temporal level is unreachable.
+    """
     system = (
         "You judge whether two claims from different papers contradict each "
-        "other under a shared experimental setting. Return only JSON."
+        "other under a shared experimental setting. Return only JSON. "
+        "Pay special attention to the verbatim evidence_quote excerpts — "
+        "they're the ground truth for what each paper actually says; ignore "
+        "paraphrasing differences in claim_text alone."
     )
-    a_year = claim_a.get("paper", {}).get("year") if isinstance(claim_a.get("paper"), dict) else ""
-    b_year = claim_b.get("paper", {}).get("year") if isinstance(claim_b.get("paper"), dict) else ""
+    year_map = year_map or {}
+    a_year = year_map.get(claim_a.get("paper_id", ""), "")
+    b_year = year_map.get(claim_b.get("paper_id", ""), "")
+
+    def _block(label: str, c: dict, year: Any) -> str:
+        lines = [
+            f"{label} (paper {c.get('paper_id', '?')}, year {year or '?'}):",
+            f"  claim_text: {c.get('claim_text', '')}",
+        ]
+        if c.get("evidence_quote"):
+            lines.append(f"  evidence_quote: {c.get('evidence_quote', '')}")
+        lines.append(
+            f"  applies_to_dims: {json.dumps(c.get('applies_to_dims', {}))}"
+        )
+        return "\n".join(lines)
+
     user = (
-        f"Claim A (paper {claim_a.get('paper_id', '?')}, year {a_year}):\n"
-        f"{claim_a.get('claim_text', '')}\n"
-        f"applies_to_dims: {json.dumps(claim_a.get('applies_to_dims', {}))}\n\n"
-        f"Claim B (paper {claim_b.get('paper_id', '?')}, year {b_year}):\n"
-        f"{claim_b.get('claim_text', '')}\n"
-        f"applies_to_dims: {json.dumps(claim_b.get('applies_to_dims', {}))}\n\n"
+        f"{_block('Claim A', claim_a, a_year)}\n\n"
+        f"{_block('Claim B', claim_b, b_year)}\n\n"
         f"Shared setting (computed): {json.dumps(shared_setting)}\n\n"
         "Levels:\n"
         "- direct: same setup + same metric, opposite numbers or opposite qualitative result\n"
         "- methodological: same problem, different methods, different conclusions\n"
         "- scope: claims agree on overlap but differ on extent (e.g. A: works at 7B; B: doesn't at 70B)\n"
-        "- temporal: later paper overturns earlier (also note level above; this is in addition)\n"
+        "- temporal: later paper overturns earlier (note in addition to level above)\n"
         "- none: not contradicting (agree, independent, or not comparable)\n\n"
         "Return JSON with keys: verdict ('contradicted' or 'not_contradicted'), "
         "level (one of direct/methodological/scope/temporal/none), "
@@ -363,8 +413,12 @@ def detect_conflicts(
     level_set = (
         {l.lower() for l in level_filter} if level_filter else None
     )
+    # Load year map once per invocation so temporal-level rule isn't dead code.
+    year_map = _load_year_map()
     for p in to_judge:
-        verdict = _llm_judge_pair(p["a"], p["b"], p["shared_setting"], model)
+        verdict = _llm_judge_pair(
+            p["a"], p["b"], p["shared_setting"], model, year_map=year_map
+        )
         if verdict is None:
             continue
         if verdict["verdict"] != "contradicted":

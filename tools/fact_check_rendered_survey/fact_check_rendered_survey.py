@@ -571,7 +571,13 @@ _CONFIDENCE_WORDS = {
 
 
 def _parse_confidence(value: Any) -> float:
-    """Accept float, int, numeric string, or word ('high'/'medium'/'low'). Default 0.5."""
+    """Accept float, int, numeric string, or word ('high'/'medium'/'low').
+
+    Why this matters for E5: any sloppy LLM confidence string used to default
+    to 0.5, which is below LOW_CONFIDENCE_THRESHOLD (0.6) → spurious E5
+    retries cost money. We try harder to recover a number from messy strings
+    ("approximately 0.7", "confidence ~85%") before falling back.
+    """
     if value is None:
         return 0.5
     if isinstance(value, (int, float)):
@@ -580,10 +586,23 @@ def _parse_confidence(value: Any) -> float:
         s = value.strip().lower()
         if s in _CONFIDENCE_WORDS:
             return _CONFIDENCE_WORDS[s]
+        # Fast path: whole-string numeric ("0.85", "85%")
         try:
             return max(0.0, min(1.0, float(s.rstrip("%")) / (100.0 if "%" in s else 1.0)))
         except ValueError:
-            return 0.5
+            pass
+        # Slow path: pull the first numeric substring out of prose
+        # ("approximately 0.7", "confidence ~85%", "high (≈0.9)")
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        if m:
+            try:
+                v = float(m.group())
+                if "%" in s or v > 1.0:
+                    v = v / 100.0
+                return max(0.0, min(1.0, v))
+            except ValueError:
+                pass
+        return 0.5
     return 0.5
 
 
@@ -767,8 +786,11 @@ def _check_claim_against_paper(
             retry_context = expanded_context
         retry_judged = _llm_judge(claim, retry_context, judge_model)
         if retry_judged:
-            orig_rank = _VERDICT_RANK.get(result.get("verdict", ""), -1)
-            new_rank = _VERDICT_RANK.get(retry_judged.get("verdict", ""), -1)
+            # Use STRICTNESS rank — escalating unsupported → contradicted is
+            # the whole point of expanded-context retry; rollup rank would
+            # incorrectly block that escalation (see C1 review note).
+            orig_rank = _STRICTNESS_RANK.get(result.get("verdict", ""), 0)
+            new_rank = _STRICTNESS_RANK.get(retry_judged.get("verdict", ""), 0)
             if new_rank < orig_rank:
                 result = retry_judged
                 expanded_retry_status = "took_stricter"
@@ -793,13 +815,16 @@ def _check_claim_against_paper(
     return result
 
 
-# Rank used to roll per-cite verdicts up to a per-attribution verdict.
-# An attribution is blocking iff its FINAL (rolled-up) verdict is non-supportive.
-# Rationale: when a talent writes `X [a][b]`, if [a] supports X, the attribution
-# is backed even if [b] doesn't — the talent just added an extra reference. The
-# per-cite detail is preserved in `items` so genuine cite-misattribution is
-# still discoverable on inspection.
-_VERDICT_RANK = {
+# Two distinct verdict orderings — they encode different judgements.
+#
+# _ROLLUP_RANK (max wins): used to aggregate multi-cite items into a single
+# per-attribution verdict. The intent is "most actionable for the talent" —
+# supported > partial > contradicted > unsupported. We rank contradicted ABOVE
+# unsupported here because, when no positive cite exists, "the paper says the
+# opposite" is more informative than "the paper doesn't say". The talent's
+# action differs (rewrite vs find better cite), and the more pointed verdict
+# should win the rollup display.
+_ROLLUP_RANK = {
     "supported": 6,
     "partially_supported": 5,
     "contradicted": 4,
@@ -809,6 +834,31 @@ _VERDICT_RANK = {
     "no_source_text": 0,
     "judge_error": -1,
 }
+
+# _STRICTNESS_RANK (lower wins for "stricter"): used by E5 retry. The retry
+# replaces the original only when the new verdict is STRICTER (more concerning
+# about the claim's truthhood). Direction matters here: a retry that escalates
+# unsupported → contradicted must be taken (extra context revealed an opposing
+# fact); a retry that relaxes contradicted → supported must NOT be taken (we
+# never relax a confident rejection).
+#
+# Strictness lattice (lowest = strictest):
+#   contradicted ≺ no_source_text ≺ source_not_in_corpus ≺ source_irrelevant
+#   ≺ unsupported ≺ partially_supported ≺ supported
+# judge_error is sentinel — treated as neutral.
+_STRICTNESS_RANK = {
+    "supported": 6,
+    "partially_supported": 5,
+    "unsupported": 4,
+    "source_irrelevant": 3,
+    "source_not_in_corpus": 2,
+    "no_source_text": 1,
+    "judge_error": 0,
+    "contradicted": -1,
+}
+# Legacy alias retained so any external caller importing _VERDICT_RANK (none
+# in this branch, but defensive) keeps working with the rollup semantics.
+_VERDICT_RANK = _ROLLUP_RANK
 _NON_BLOCKING = {"supported", "partially_supported"}
 
 
@@ -826,7 +876,7 @@ def _aggregate_attributions(items: list[dict]) -> list[dict]:
 
     per_attr: list[dict] = []
     for attr_id, sub in groups.items():
-        best = max(sub, key=lambda x: _VERDICT_RANK.get(x.get("verdict", "judge_error"), -1))
+        best = max(sub, key=lambda x: _ROLLUP_RANK.get(x.get("verdict", "judge_error"), -1))
         per_attr.append({
             "attribution_id": attr_id,
             "claim_text": best.get("claim_text", ""),

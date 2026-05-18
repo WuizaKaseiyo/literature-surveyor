@@ -20,10 +20,31 @@ into layered mode.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import sys
 import time
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def _global_lock(global_dir: Path):
+    """fcntl-based exclusive lock on the global corpus dir.
+
+    Same lock file (`<global>/.lock`) used by corpus_store._global_write_lock,
+    so a live OMC agent doing corpus_add_paper during a migration will block
+    rather than interleave bytes into papers.jsonl / claims.jsonl.
+    """
+    global_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = global_dir / ".lock"
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -107,21 +128,36 @@ def migrate(
         print(json.dumps(summary, indent=2))
         return summary
 
-    # Write to global (append-only)
-    if papers_to_promote:
-        with dst_papers.open("a") as f:
-            for p in papers_to_promote:
-                f.write(json.dumps(p, ensure_ascii=False) + "\n")
-    if claims_to_promote:
-        with dst_claims.open("a") as f:
-            for c in claims_to_promote:
-                f.write(json.dumps(c, ensure_ascii=False) + "\n")
+    # Acquire the SAME global write lock corpus_store uses, so a concurrent
+    # OMC agent doing corpus_add_paper can't interleave bytes mid-migration.
+    with _global_lock(global_dir):
+        if papers_to_promote:
+            with dst_papers.open("a") as f:
+                for p in papers_to_promote:
+                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
+        if claims_to_promote:
+            with dst_claims.open("a") as f:
+                for c in claims_to_promote:
+                    f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
-    # Project refs (overwrite — refs.jsonl is per-project derived data)
-    if refs_to_write:
-        with dst_refs.open("w") as f:
-            for r in refs_to_write:
+    # Project refs: append + dedup by (paper_id, source_query). Previously we
+    # truncated, which broke idempotency — re-running migration after some
+    # layered-mode `corpus_add_paper` activity would wipe out refs added in
+    # the meantime.
+    existing_refs = _read_jsonl(dst_refs)
+    existing_keys = {
+        (r.get("paper_id"), r.get("source_query", "")) for r in existing_refs
+    }
+    new_refs = [
+        r for r in refs_to_write
+        if (r.get("paper_id"), r.get("source_query", "")) not in existing_keys
+    ]
+    if new_refs:
+        with dst_refs.open("a") as f:
+            for r in new_refs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    summary["refs_appended"] = len(new_refs)
+    summary["refs_skipped_dup"] = len(refs_to_write) - len(new_refs)
 
     # project_meta.json
     if not project_meta.exists():
