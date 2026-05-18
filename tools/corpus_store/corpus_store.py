@@ -19,6 +19,9 @@ because OMC sets CWD to the project workspace before invoking tools.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -119,10 +122,6 @@ def _looks_like_workspace() -> bool:
 # ---------------------------------------------------------------------------
 # A2/A3: project refs + write lock for the shared global store
 # ---------------------------------------------------------------------------
-
-import contextlib
-import fcntl
-import hashlib
 
 
 def _project_id() -> str:

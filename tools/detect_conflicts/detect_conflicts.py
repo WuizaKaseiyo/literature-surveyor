@@ -17,7 +17,6 @@ can be inlined directly into `stage2.json`.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import time
@@ -50,8 +49,6 @@ _STOP = frozenset(
 
 
 def _corpus_dir() -> Path:
-    # A2 layered mode: claims live in global. Mirror the resolution used by
-    # other tools so detect_conflicts sees the same data.
     g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
     if g:
         path = Path(g).expanduser()

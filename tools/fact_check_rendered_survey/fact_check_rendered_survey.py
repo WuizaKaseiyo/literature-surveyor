@@ -29,25 +29,23 @@ CITE_PATTERN = re.compile(
 FENCED_CODE_PATTERN = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_PATTERN = re.compile(r"`[^`]*`")
 SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
-NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:\d+(?:\.\d+)?%?|\d+(?:\.\d+)?[KMBTkmbt]?)")
-# E2: number-with-unit pattern. Captures the digit string + the unit slot in one shot.
-# Unit alternatives (in priority order):
-#   \s*%                          → percent sign
-#   \s+(?:percent|percentage|pct) → percent word form (must be preceded by space)
-#   [KMBTkmbt]\b                  → scale suffix (Big-K/M/B/T) with word boundary
-#   ε                             → bare number, no unit
+# Number-with-unit: captures digits + unit (% / percent word / K/M/B/T / ε)
 _NUM_WITH_UNIT_PAT = re.compile(
     r"(?<![A-Za-z0-9])"
     r"(-?\d+(?:\.\d+)?)"
     r"(\s*%|\s+(?:percent|percentage|pct)\b|[KMBTkmbt]\b|)",
     re.IGNORECASE,
 )
-_NUMBER_TOLERANCE = 0.05  # relative tolerance for numeric matching
+_NUMBER_TOLERANCE = 0.05                # E2: numeric match relative tolerance
 MAX_SOURCE_CHARS = 50000
 MAX_CONTEXT_CHARS = 6000
 EXPANDED_CONTEXT_CHARS = 12000          # E5: borderline-retry budget
 LOW_CONFIDENCE_THRESHOLD = 0.6          # E5: confidence floor below which we retry
 EXPANDABLE_VERDICTS = {"unsupported", "partially_supported"}  # only retry these
+_MIN_MATCH_JACCARD = 0.12               # E1: anchor match floor (Jaccard)
+_MIN_MATCH_OVERLAP_TOKENS = 3           # E1: anchor match floor (overlap count)
+_ADDITIONAL_CONTEXT_CHARS = 3000        # anchor + BM25 trailing budget
+_MAX_CHECKS_HARD_CAP = 1000             # @tool max_checks ceiling
 
 VERDICTS = {
     "supported",
@@ -72,8 +70,6 @@ _STOP = frozenset(
 
 
 def _corpus_dir() -> Path:
-    # A2 layered mode: entity store (papers.jsonl, claims.jsonl) lives in the
-    # global dir so cross-project anchoring works automatically.
     g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
     if g:
         path = Path(g).expanduser()
@@ -146,22 +142,20 @@ def _match_claim_to_sentence(
 
     best: dict | None = None
     best_score = 0.0
-    best_overlap = 0
     for c in claims:
         text = (c.get("claim_text") or "") + " " + (c.get("evidence_quote") or "")
         c_tokens = set(_tokenize(text))
         if not c_tokens:
             continue
         overlap = sent_tokens & c_tokens
-        if len(overlap) < 3:
+        if len(overlap) < _MIN_MATCH_OVERLAP_TOKENS:
             continue
         score = len(overlap) / max(len(sent_tokens | c_tokens), 1)
         if score > best_score:
             best_score = score
-            best_overlap = len(overlap)
             best = c
 
-    if best is None or best_score < 0.12 or best_overlap < 3:
+    if best is None or best_score < _MIN_MATCH_JACCARD:
         return None, best_score
     return best, best_score
 
@@ -355,18 +349,6 @@ def parse_attributions(markdown: str) -> list[dict[str, Any]]:
 
 def _tokenize(text: str) -> list[str]:
     return [t.lower() for t in _TOKEN_RE.findall(text or "") if t.lower() not in _STOP]
-
-
-def _numbers(text: str) -> set[str]:
-    """Legacy bag-of-numbers extractor. Retained for callers that want a coarse
-    set of stringified numbers; the heuristic now uses
-    _extract_numbers_with_unit + _numbers_match for unit-aware tolerance.
-    """
-    out = set()
-    for n in NUMBER_PATTERN.findall(text or ""):
-        out.add(n.lower())
-        out.add(n.lower().rstrip("%"))
-    return out
 
 
 def _extract_numbers_with_unit(text: str) -> list[tuple[float, str]]:
@@ -686,8 +668,8 @@ def _llm_judge(claim: str, context: str, model: str) -> dict[str, Any] | None:
     return {
         "verdict": verdict,
         "confidence": _parse_confidence(data.get("confidence")),
-        "evidence_quote": str(data.get("evidence_quote", "") or "")[:1200],
-        "explanation": str(data.get("explanation", "") or "")[:1200],
+        "evidence_quote": str(data.get("evidence_quote", ""))[:1200],
+        "explanation": str(data.get("explanation", ""))[:1200],
         "judge": f"llm:{model}",
     }
 
@@ -747,7 +729,7 @@ def _check_claim_against_paper(
     if anchor_block:
         # Use the pre-extracted claim as the primary anchor for the LLM judge.
         # Old BM25 context is still appended for additional grounding.
-        judge_context = anchor_block + "\n\n---\n\nAdditional source context:\n" + context[:3000]
+        judge_context = anchor_block + "\n\n---\n\nAdditional source context:\n" + context[:_ADDITIONAL_CONTEXT_CHARS]
     else:
         judge_context = context
 
@@ -815,50 +797,22 @@ def _check_claim_against_paper(
     return result
 
 
-# Two distinct verdict orderings — they encode different judgements.
-#
-# _ROLLUP_RANK (max wins): used to aggregate multi-cite items into a single
-# per-attribution verdict. The intent is "most actionable for the talent" —
-# supported > partial > contradicted > unsupported. We rank contradicted ABOVE
-# unsupported here because, when no positive cite exists, "the paper says the
-# opposite" is more informative than "the paper doesn't say". The talent's
-# action differs (rewrite vs find better cite), and the more pointed verdict
-# should win the rollup display.
+# Two verdict orderings — different semantics. See test_rollup_rank_aggregation_matrix
+# and test_strictness_rank_invariants for the contract.
+#   ROLLUP (max wins):    multi-cite display; contradicted ranks ABOVE unsupported
+#                          (more informative when no positive cite exists)
+#   STRICTNESS (min wins): E5 retry; contradicted is the STRICTEST so retry can
+#                          escalate unsupported → contradicted but never relax
 _ROLLUP_RANK = {
-    "supported": 6,
-    "partially_supported": 5,
-    "contradicted": 4,
-    "unsupported": 3,
-    "source_irrelevant": 2,
-    "source_not_in_corpus": 1,
-    "no_source_text": 0,
+    "supported": 6, "partially_supported": 5, "contradicted": 4, "unsupported": 3,
+    "source_irrelevant": 2, "source_not_in_corpus": 1, "no_source_text": 0,
     "judge_error": -1,
 }
-
-# _STRICTNESS_RANK (lower wins for "stricter"): used by E5 retry. The retry
-# replaces the original only when the new verdict is STRICTER (more concerning
-# about the claim's truthhood). Direction matters here: a retry that escalates
-# unsupported → contradicted must be taken (extra context revealed an opposing
-# fact); a retry that relaxes contradicted → supported must NOT be taken (we
-# never relax a confident rejection).
-#
-# Strictness lattice (lowest = strictest):
-#   contradicted ≺ no_source_text ≺ source_not_in_corpus ≺ source_irrelevant
-#   ≺ unsupported ≺ partially_supported ≺ supported
-# judge_error is sentinel — treated as neutral.
 _STRICTNESS_RANK = {
-    "supported": 6,
-    "partially_supported": 5,
-    "unsupported": 4,
-    "source_irrelevant": 3,
-    "source_not_in_corpus": 2,
-    "no_source_text": 1,
-    "judge_error": 0,
+    "supported": 6, "partially_supported": 5, "unsupported": 4, "source_irrelevant": 3,
+    "source_not_in_corpus": 2, "no_source_text": 1, "judge_error": 0,
     "contradicted": -1,
 }
-# Legacy alias retained so any external caller importing _VERDICT_RANK (none
-# in this branch, but defensive) keeps working with the rollup semantics.
-_VERDICT_RANK = _ROLLUP_RANK
 _NON_BLOCKING = {"supported", "partially_supported"}
 
 
@@ -1006,7 +960,7 @@ def fact_check_rendered_survey(
     for attr in attributions:
         preferred_ids = attr.get("preferred_claim_ids") or []
         for cite in attr["citations"]:
-            if len(items) >= max(1, min(int(max_checks), 1000)):
+            if len(items) >= max(1, min(int(max_checks), _MAX_CHECKS_HARD_CAP)):
                 break
             kind = cite["kind"].lower()
             cite_id = _normalize_cite_id(cite["id"])
@@ -1047,7 +1001,7 @@ def fact_check_rendered_survey(
                     "expanded_retry": result.get("expanded_retry", ""),
                 }
             )
-        if len(items) >= max(1, min(int(max_checks), 1000)):
+        if len(items) >= max(1, min(int(max_checks), _MAX_CHECKS_HARD_CAP)):
             break
 
     per_attribution = _aggregate_attributions(items)

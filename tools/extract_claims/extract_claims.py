@@ -51,8 +51,6 @@ class Claim(BaseModel):
 
 
 def _corpus_dir() -> Path:
-    # A2 layered mode: papers.jsonl + claims.jsonl live in the global store,
-    # so claims written here are shared across projects automatically.
     g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
     if g:
         path = Path(g).expanduser()
@@ -99,13 +97,9 @@ def _append_claims(claims: list[dict]) -> None:
 
 
 def _call_llm_with_retry(system: str, user: str, model: str, max_retries: int = 1) -> str:
-    """Wrap _invoke_llm with a single retry on empty response.
+    """Retry _invoke_llm once on empty response (transient API blip).
 
-    Only retries when the first call returned "" — that's the transient case
-    (API blip, rate limit, momentary auth issue). Does not retry on malformed
-    JSON — that's handled by _parse_claims_response. Backoff 0.3s between
-    attempts, capped at max_retries (default 1).
-    """
+    Malformed JSON is handled by _parse_claims_response, not retried here."""
     raw = _invoke_llm(system, user, model)
     if raw:
         return raw
@@ -430,11 +424,15 @@ def _extract_v2(paper: dict, model: str) -> tuple[list[dict], list[str]]:
 def _invoke_llm(system: str, user: str, model: str) -> str:
     """Try multiple LLM clients in order of preference."""
 
-    # Option 1: OMC's make_llm (if running inside OMC and importable)
+    # Option 1: OMC's make_llm (if running inside OMC and importable).
+    # Employee id resolution matches sibling tools: prefer the calling
+    # employee's id from env, fall back to a known researcher id only as
+    # a last resort.
     try:
         from onemancompany.agents.base import make_llm  # type: ignore
 
-        llm = make_llm("00007")  # any researcher id; we just want the LLM client
+        employee_id = os.getenv("OMC_EMPLOYEE_ID") or os.getenv("LITSURVEY_EMPLOYEE_ID") or ""
+        llm = make_llm(employee_id) if employee_id else make_llm("00007")
         result = llm.invoke([
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -539,9 +537,6 @@ def extract_claims(
             "paper_id": paper_id,
         }
 
-    # A2 cross-project reuse short-circuit: if claims already exist for this
-    # paper, return them without burning an LLM call (the main reason layered
-    # corpus mode pays off).
     if not force:
         existing = _load_existing_claims_for(paper_id)
         if existing:
@@ -622,8 +617,6 @@ def extract_claims(
             "warnings": warnings,
         }
 
-    # v1 is the legacy path. Default flipped to v2 in this release; v1 still
-    # works but is deprecated. Loud warning in the return payload.
     v1_deprecation = (
         "v1 is the legacy 30K-truncated single-shot path; default is now v2. "
         "Pass version='v2' explicitly for section-aware extraction + quote verification."

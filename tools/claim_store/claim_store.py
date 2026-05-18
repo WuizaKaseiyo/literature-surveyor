@@ -44,12 +44,7 @@ _STOP = frozenset(
 
 
 def _corpus_dir() -> Path:
-    """Resolve corpus directory. Mirrors corpus_store._corpus_dir exactly.
-
-    A2 layered mode: claims.jsonl lives in the global entity store when
-    LITSURVEY_GLOBAL_CORPUS_DIR is set, so cross-project reuse of extracted
-    claims is automatic.
-    """
+    """Resolve corpus directory. Mirrors corpus_store._corpus_dir exactly."""
     g = os.getenv("LITSURVEY_GLOBAL_CORPUS_DIR")
     if g:
         path = Path(g).expanduser()
@@ -407,7 +402,3 @@ def claim_find_evidence(
         "query": claim_text,
         "matches": matches,
     }
-
-
-# Module-load timestamp (lets tests assert side effects didn't fire at import)
-_LOADED_AT = time.time()
