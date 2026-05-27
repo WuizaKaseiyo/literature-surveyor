@@ -583,7 +583,9 @@ def corpus_list_papers(
             `from_project` tag. Ignored in legacy mode.
 
     Returns:
-        {"papers": [{"id": "...", "title": "...", "year": ..., "source": "..."}, ...]}
+        {"papers": [{"id": "...", "title": "...", "authors": [...],
+                     "year": ..., "source": "...",
+                     "has_full_text": bool}, ...]}
     """
     layered = _in_layered_mode()
     scope_norm = scope.strip().lower() if scope else "project"
@@ -604,6 +606,7 @@ def corpus_list_papers(
         item = {
             "id": p.get("id", ""),
             "title": p.get("title", ""),
+            "authors": p.get("authors") or [],
             "year": p.get("year"),
             "source": p.get("source", ""),
             "has_full_text": bool(p.get("full_text_md")),
