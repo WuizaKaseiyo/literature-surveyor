@@ -820,11 +820,31 @@ def _global_rerank(
     return keep_ids, drop_reasons, "ok"
 
 
-def _hard_filter(candidate: dict) -> tuple[bool, str]:
-    """Deterministic out-of-LLM gate. Returns (keep, drop_reason).
+def _coerce_int(value: Any, default: int = -1) -> int:
+    """Best-effort int coercion that never raises.
 
-    Applied after rerank (to catch what rerank missed) AND as the only filter
-    when rerank itself falls back.
+    `contribution_idx` comes straight from LLM JSON; models routinely emit
+    `null`, "", or "n/a" when they can't ground a claim. A bare int() would
+    raise TypeError/ValueError — which is NOT a ValidationError, so it escapes
+    the per-claim try/except and crashes the whole extract_claims call.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _hard_filter(candidate: dict) -> tuple[bool, str]:
+    """Deterministic UNCONDITIONAL drops. Returns (keep, drop_reason).
+
+    Only drops claims that are never useful regardless of what else the paper
+    yields: noise saliency and quotes that failed verbatim verification.
+
+    The scope-less-factual rule is intentionally NOT here — see
+    `_is_scopeless_factual` + the soft pass in `_extract_v3` step 4. Making it
+    unconditional here let a paper whose claims all lacked structured
+    applies_to_dims (e.g. meta_pass fell back, or the LLM never filled dims)
+    collapse to ZERO claims, a recall regression vs v2.
     """
     sal = candidate.get("saliency_type") or "empirical_finding"
     if sal in V3_NOISE_SALIENCY:
@@ -833,15 +853,21 @@ def _hard_filter(candidate: dict) -> tuple[bool, str]:
     if candidate.get("evidence_quote") and not candidate.get("evidence_quote_verified", False):
         return False, "unverified_quote"
 
-    # Factual claim with no scope at all is too vague to be useful for synthesis.
-    ctype = candidate.get("claim_type", "factual")
-    dims = candidate.get("applies_to_dims") or {}
-    if ctype == "factual" and sal not in ("limitation", "method_proposed"):
-        dims_nonempty = isinstance(dims, dict) and any(v for v in dims.values())
-        if not dims_nonempty:
-            return False, "factual_no_scope"
-
     return True, ""
+
+
+def _is_scopeless_factual(candidate: dict) -> bool:
+    """A factual claim with no scope dims — too vague to be the *preferred*
+    synthesis input when better claims exist, but kept as a floor when it's all
+    a paper produced. Applied softly in `_extract_v3` (never zeroes a paper)."""
+    sal = candidate.get("saliency_type") or "empirical_finding"
+    if sal in ("limitation", "method_proposed"):
+        return False
+    if candidate.get("claim_type", "factual") != "factual":
+        return False
+    dims = candidate.get("applies_to_dims") or {}
+    dims_nonempty = isinstance(dims, dict) and any(v for v in dims.values())
+    return not dims_nonempty
 
 
 def _extract_v3(paper: dict, model: str) -> tuple[list[dict], list[str], dict[str, Any]]:
@@ -984,6 +1010,25 @@ def _extract_v3(paper: dict, model: str) -> tuple[list[dict], list[str], dict[st
         else:
             warnings.append(f"hard_filter dropped: {reason} ({(c.get('claim_text') or '')[:60]!r})")
             meta_info["n_dropped_hard"] += 1
+
+    # ---- Step 4b: soft scope-less-factual filter (never zeroes a paper) ------
+    # Drop vague scope-less factual claims ONLY when stronger (scoped /
+    # limitation / method) claims remain. If they're all the paper yields, keep
+    # them — a vague claim beats returning zero (which v2 never did).
+    scoped = [c for c in kept if not _is_scopeless_factual(c)]
+    if scoped and len(scoped) < len(kept):
+        for c in kept:
+            if _is_scopeless_factual(c):
+                warnings.append(
+                    f"soft_filter dropped scope-less factual: {(c.get('claim_text') or '')[:60]!r}"
+                )
+                meta_info["n_dropped_hard"] += 1
+        kept = scoped
+    elif kept and not scoped:
+        warnings.append(
+            "all kept claims are scope-less factual — keeping them to avoid "
+            "0-claim output (v2-parity floor)"
+        )
 
     # Re-pack dedup_rank to be dense 0..k-1 after hard_filter drops.
     kept.sort(key=lambda c: c.get("dedup_rank", 0))
@@ -1162,7 +1207,7 @@ def extract_claims(
                     source_section=raw.get("source_section", ""),
                     confidence=raw.get("confidence", 0.5),
                     applies_to=applies_to_legacy,
-                    contribution_idx=int(raw.get("contribution_idx", -1)),
+                    contribution_idx=_coerce_int(raw.get("contribution_idx", -1)),
                     dedup_rank=raw.get("dedup_rank"),
                 )
                 validated.append(
