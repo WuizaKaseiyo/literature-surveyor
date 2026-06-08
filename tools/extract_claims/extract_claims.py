@@ -168,6 +168,22 @@ def _replace_claims_for(paper_id: str, new_claims: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Module-level stash for the most recent structured LLM error. The top-level
+# `extract_claims` tool drains this into `warnings` so auth / endpoint /
+# model-not-found failures stop masquerading as "0 claims" (issue #5). Using a
+# module global keeps `_invoke_llm`'s `str` return contract intact — existing
+# tests that mock `_invoke_llm` to return a string still work — while still
+# letting callers surface diagnostics.
+_LAST_LLM_ERRORS: list[dict] = []
+
+
+def _drain_llm_errors() -> list[dict]:
+    """Return and clear all pending LLM errors stashed since the last drain."""
+    out = list(_LAST_LLM_ERRORS)
+    _LAST_LLM_ERRORS.clear()
+    return out
+
+
 def _call_llm_with_retry(system: str, user: str, model: str, max_retries: int = 1) -> str:
     """Retry _invoke_llm once on empty response (transient API blip).
 
@@ -1038,8 +1054,89 @@ def _extract_v3(paper: dict, model: str) -> tuple[list[dict], list[str], dict[st
     return kept, warnings, meta_info
 
 
+# NOTE: _resolve_llm_endpoint / _classify_llm_error / _invoke_llm are kept
+# byte-for-byte in sync across extract_claims / detect_conflicts /
+# fact_check_rendered_survey. OMC's tool loader treats each tools/<name>/
+# <name>.py as a standalone module (CLAUDE.md gotcha #3), so a shared module
+# import doesn't survive deployment — duplication is intentional. Change here →
+# change in the other two.
+
+
+def _resolve_llm_endpoint() -> tuple[str, str | None]:
+    """Resolve (api_key, base_url) for the OpenAI-compatible client.
+
+    Many deployments (LiteLLM / one-api / self-hosted gateway) reuse the
+    OPENROUTER_API_KEY env var name for what is really a proxy key — the
+    actual endpoint lives in OPENROUTER_BASE_URL / OPENAI_BASE_URL etc.
+    Branching on the *variable name* (the pre-fix behaviour) sent those
+    deployments to openrouter.ai and got 401s that the silent error path
+    then swallowed (issue #5).
+
+    Priority for base_url:
+      1. OPENROUTER_BASE_URL  2. OPENAI_BASE_URL
+      3. DEFAULT_API_BASE_URL 4. MEMENTO_MINI_BASE_URL
+      5. https://openrouter.ai/api/v1 — only when OPENROUTER_API_KEY is set
+         AND no base_url is configured AND no OPENAI_API_KEY is present
+         (preserves the historical native-OpenRouter fallback)
+      6. None — let the OpenAI SDK use its default
+    """
+    api_key = (
+        os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    )
+    base_url = (
+        os.getenv("OPENROUTER_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("DEFAULT_API_BASE_URL")
+        or os.getenv("MEMENTO_MINI_BASE_URL")
+    )
+    if (
+        not base_url
+        and os.getenv("OPENROUTER_API_KEY")
+        and not os.getenv("OPENAI_API_KEY")
+    ):
+        base_url = "https://openrouter.ai/api/v1"
+    return api_key, base_url
+
+
+def _classify_llm_error(exc: Exception, base_url: str | None, model: str) -> dict:
+    """Map an OpenAI SDK exception to a diagnosable dict — secrets-safe.
+
+    Used to turn silently-swallowed 401/timeout/etc. failures into a warning
+    the LLM (and the human reading the output) can act on, instead of the
+    pre-fix behaviour where every error collapsed to '0 claims' (issue #5).
+    """
+    name = type(exc).__name__
+    kind = {
+        "AuthenticationError": "auth_error",
+        "PermissionDeniedError": "auth_error",
+        "RateLimitError": "rate_limit",
+        "NotFoundError": "model_not_found",
+        "BadRequestError": "bad_request",
+        "APIConnectionError": "connection_error",
+        "APITimeoutError": "connection_error",
+    }.get(name, "unknown")
+    host = ""
+    if base_url:
+        try:
+            from urllib.parse import urlparse
+
+            host = urlparse(base_url).hostname or ""
+        except Exception:
+            host = ""
+    return {
+        "error_kind": kind,
+        "error": str(exc)[:300],
+        "base_url_host": host,
+        "model": model,
+    }
+
+
 def _invoke_llm(system: str, user: str, model: str) -> str:
-    """Try multiple LLM clients in order of preference."""
+    """Try multiple LLM clients in order of preference.
+
+    On error, stashes a `{error_kind, error, base_url_host, model}` dict in
+    _LAST_LLM_ERRORS for the top-level tool to drain into `warnings` so
+    failures stop masquerading as "0 claims" (issue #5)."""
 
     # Option 1: OMC's make_llm (if running inside OMC and importable).
     # Employee id resolution matches sibling tools: prefer the calling
@@ -1058,20 +1155,19 @@ def _invoke_llm(system: str, user: str, model: str) -> str:
     except Exception:
         pass
 
-    # Option 2: openai client (works for OpenAI direct + OpenRouter)
+    # Option 2: openai client (works for OpenAI direct + OpenRouter + proxies)
+    api_key, base_url = _resolve_llm_endpoint()
+    if not api_key:
+        _LAST_LLM_ERRORS.append({
+            "error_kind": "missing_api_key",
+            "error": "no OPENROUTER_API_KEY or OPENAI_API_KEY in environment",
+            "base_url_host": "",
+            "model": model,
+        })
+        return ""
     try:
         from openai import OpenAI  # type: ignore
 
-        api_key = (
-            os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-        )
-        if not api_key:
-            return ""
-        base_url = (
-            "https://openrouter.ai/api/v1"
-            if os.getenv("OPENROUTER_API_KEY")
-            else None
-        )
         client = OpenAI(api_key=api_key, base_url=base_url)
         rsp = client.chat.completions.create(
             model=model,
@@ -1082,7 +1178,8 @@ def _invoke_llm(system: str, user: str, model: str) -> str:
             ],
         )
         return rsp.choices[0].message.content or ""
-    except Exception:
+    except Exception as exc:
+        _LAST_LLM_ERRORS.append(_classify_llm_error(exc, base_url, model))
         return ""
 
 
@@ -1179,8 +1276,20 @@ def extract_claims(
     if not paper:
         return {"error": f"paper not found in corpus: {paper_id}"}
 
+    # Clear any stale LLM errors from a previous call; we'll drain post-extract
+    # so callers see auth / endpoint / model-not-found failures in `warnings`
+    # rather than just "0 claims" (issue #5).
+    _drain_llm_errors()
+
     if version == "v3":
         raw_claims, warnings, meta_info = _extract_v3(paper, model)
+        _llm_errs = _drain_llm_errors()
+        if _llm_errs:
+            warnings = [
+                f"llm_error[{e['error_kind']}] model={e.get('model','?')} "
+                f"host={e.get('base_url_host') or '(default)'}: {e['error']}"
+                for e in _llm_errs
+            ] + warnings
         if not raw_claims:
             return {
                 "error": "v3 extraction returned no claims",
@@ -1252,6 +1361,13 @@ def extract_claims(
 
     if version == "v2":
         raw_claims, warnings = _extract_v2(paper, model)
+        _llm_errs = _drain_llm_errors()
+        if _llm_errs:
+            warnings = [
+                f"llm_error[{e['error_kind']}] model={e.get('model','?')} "
+                f"host={e.get('base_url_host') or '(default)'}: {e['error']}"
+                for e in _llm_errs
+            ] + warnings
         if not raw_claims:
             return {
                 "error": "v2 extraction returned no claims",
@@ -1328,6 +1444,7 @@ def extract_claims(
         }
 
     raw_claims, v1_parse_mode = _call_llm_for_claims(text, paper, model)
+    _llm_errs = _drain_llm_errors()
     if not raw_claims:
         return {
             "error": f"LLM returned no parseable claims ({v1_parse_mode})",
@@ -1335,10 +1452,21 @@ def extract_claims(
             "version": "v1",
             "claims_extracted": 0,
             "claims": [],
+            "warnings": [
+                f"llm_error[{e['error_kind']}] model={e.get('model','?')} "
+                f"host={e.get('base_url_host') or '(default)'}: {e['error']}"
+                for e in _llm_errs
+            ],
         }
 
     validated: list[dict] = []
     warnings: list[str] = [f"DEPRECATED: {v1_deprecation}"]
+    if _llm_errs:
+        warnings = [
+            f"llm_error[{e['error_kind']}] model={e.get('model','?')} "
+            f"host={e.get('base_url_host') or '(default)'}: {e['error']}"
+            for e in _llm_errs
+        ] + warnings
     if v1_parse_mode.startswith("salvaged_"):
         warnings.append(
             f"v1 LLM response malformed; rescued via partial parse ({v1_parse_mode})"

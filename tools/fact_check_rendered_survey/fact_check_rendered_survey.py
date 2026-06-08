@@ -603,6 +603,72 @@ def _parse_llm_json(raw: str) -> dict | None:
         return None
 
 
+# NOTE: _resolve_llm_endpoint / _classify_llm_error / _invoke_llm are kept
+# byte-for-byte in sync across extract_claims / detect_conflicts /
+# fact_check_rendered_survey. OMC's tool loader treats each tools/<name>/
+# <name>.py as a standalone module (CLAUDE.md gotcha #3), so a shared module
+# import doesn't survive deployment — duplication is intentional. Change here →
+# change in the other two.
+
+
+def _resolve_llm_endpoint() -> tuple[str, str | None]:
+    """Resolve (api_key, base_url). See extract_claims._resolve_llm_endpoint
+    for the full priority discussion (issue #5)."""
+    api_key = (
+        os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    )
+    base_url = (
+        os.getenv("OPENROUTER_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("DEFAULT_API_BASE_URL")
+        or os.getenv("MEMENTO_MINI_BASE_URL")
+    )
+    if (
+        not base_url
+        and os.getenv("OPENROUTER_API_KEY")
+        and not os.getenv("OPENAI_API_KEY")
+    ):
+        base_url = "https://openrouter.ai/api/v1"
+    return api_key, base_url
+
+
+def _classify_llm_error(exc: Exception, base_url: str | None, model: str) -> dict:
+    """Secrets-safe error classifier mirroring extract_claims (issue #5)."""
+    name = type(exc).__name__
+    kind = {
+        "AuthenticationError": "auth_error",
+        "PermissionDeniedError": "auth_error",
+        "RateLimitError": "rate_limit",
+        "NotFoundError": "model_not_found",
+        "BadRequestError": "bad_request",
+        "APIConnectionError": "connection_error",
+        "APITimeoutError": "connection_error",
+    }.get(name, "unknown")
+    host = ""
+    if base_url:
+        try:
+            from urllib.parse import urlparse
+
+            host = urlparse(base_url).hostname or ""
+        except Exception:
+            host = ""
+    return {
+        "error_kind": kind,
+        "error": str(exc)[:300],
+        "base_url_host": host,
+        "model": model,
+    }
+
+
+_LAST_LLM_ERRORS: list[dict] = []
+
+
+def _drain_llm_errors() -> list[dict]:
+    out = list(_LAST_LLM_ERRORS)
+    _LAST_LLM_ERRORS.clear()
+    return out
+
+
 def _invoke_llm(system: str, user: str, model: str) -> str:
     try:
         from onemancompany.agents.base import make_llm  # type: ignore
@@ -617,13 +683,18 @@ def _invoke_llm(system: str, user: str, model: str) -> str:
     except Exception:
         pass
 
+    api_key, base_url = _resolve_llm_endpoint()
+    if not api_key:
+        _LAST_LLM_ERRORS.append({
+            "error_kind": "missing_api_key",
+            "error": "no OPENROUTER_API_KEY or OPENAI_API_KEY in environment",
+            "base_url_host": "",
+            "model": model,
+        })
+        return ""
     try:
         from openai import OpenAI  # type: ignore
 
-        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-        if not api_key:
-            return ""
-        base_url = "https://openrouter.ai/api/v1" if os.getenv("OPENROUTER_API_KEY") else None
         client = OpenAI(api_key=api_key, base_url=base_url)
         rsp = client.chat.completions.create(
             model=model,
@@ -634,7 +705,8 @@ def _invoke_llm(system: str, user: str, model: str) -> str:
             ],
         )
         return rsp.choices[0].message.content or ""
-    except Exception:
+    except Exception as exc:
+        _LAST_LLM_ERRORS.append(_classify_llm_error(exc, base_url, model))
         return ""
 
 
@@ -958,6 +1030,8 @@ def fact_check_rendered_survey(
     papers = _load_papers()
     lookup = _paper_lookup(papers)
 
+    _drain_llm_errors()  # clear any stale state from a prior invocation
+
     items: list[dict[str, Any]] = []
     for attr in attributions:
         preferred_ids = attr.get("preferred_claim_ids") or []
@@ -1008,7 +1082,8 @@ def fact_check_rendered_survey(
 
     per_attribution = _aggregate_attributions(items)
     summary = _summary(items, per_attribution)
-    return {
+    llm_errors = _drain_llm_errors()
+    result_payload = {
         **summary,
         "items": items,
         "per_attribution": per_attribution,
@@ -1018,3 +1093,12 @@ def fact_check_rendered_survey(
         "input_mode": input_mode,
         "verification_method": f"final attribution fact check ({input_mode})",
     }
+    if llm_errors:
+        # Surface auth / endpoint / model failures so blanket "unverifiable"
+        # verdicts are explained, not silent (issue #5).
+        result_payload["llm_warnings"] = [
+            f"llm_error[{e['error_kind']}] model={e.get('model','?')} "
+            f"host={e.get('base_url_host') or '(default)'}: {e['error']}"
+            for e in llm_errors
+        ]
+    return result_payload
